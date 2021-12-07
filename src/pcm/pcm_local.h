@@ -420,6 +420,8 @@ int _snd_pcm_poll_descriptor(snd_pcm_t *pcm);
 #define _snd_pcm_async_descriptor _snd_pcm_poll_descriptor /* FIXME */
 
 /* locked versions */
+int __snd_pcm_mmap_begin_generic(snd_pcm_t *pcm, const snd_pcm_channel_area_t **areas,
+				 snd_pcm_uframes_t *offset, snd_pcm_uframes_t *frames);
 int __snd_pcm_mmap_begin(snd_pcm_t *pcm, const snd_pcm_channel_area_t **areas,
 			 snd_pcm_uframes_t *offset, snd_pcm_uframes_t *frames);
 snd_pcm_sframes_t __snd_pcm_mmap_commit(snd_pcm_t *pcm,
@@ -444,7 +446,7 @@ static inline int __snd_pcm_start(snd_pcm_t *pcm)
 static inline snd_pcm_state_t __snd_pcm_state(snd_pcm_t *pcm)
 {
 	if (!pcm->fast_ops->state)
-		return -ENOSYS;
+		return SND_PCM_STATE_OPEN;
 	return pcm->fast_ops->state(pcm->fast_op_arg);
 }
 
@@ -480,6 +482,13 @@ static inline int snd_pcm_check_error(snd_pcm_t *pcm, int err)
 	return err;
 }
 
+/**
+ * \retval number of frames available to the application for playback
+ *
+ * This is how far ahead the hardware position in the ring buffer is,
+ * compared to the application position. ie. for playback it's the
+ * number of frames in the empty part of the ring buffer.
+ */
 static inline snd_pcm_uframes_t __snd_pcm_playback_avail(snd_pcm_t *pcm,
 							 const snd_pcm_uframes_t hw_ptr,
 							 const snd_pcm_uframes_t appl_ptr)
@@ -498,6 +507,13 @@ static inline snd_pcm_uframes_t snd_pcm_mmap_playback_avail(snd_pcm_t *pcm)
 	return __snd_pcm_playback_avail(pcm, *pcm->hw.ptr, *pcm->appl.ptr);
 }
 
+/*
+ * \retval number of frames available to the application for capture
+ *
+ * This is how far ahead the hardware position in the ring buffer is
+ * compared to the application position.  ie. for capture, it's the
+ * number of frames in the filled part of the ring buffer.
+ */
 static inline snd_pcm_uframes_t __snd_pcm_capture_avail(snd_pcm_t *pcm,
 							const snd_pcm_uframes_t hw_ptr,
 							const snd_pcm_uframes_t appl_ptr)
@@ -529,11 +545,21 @@ static inline snd_pcm_uframes_t snd_pcm_mmap_avail(snd_pcm_t *pcm)
 	return __snd_pcm_avail(pcm, *pcm->hw.ptr, *pcm->appl.ptr);
 }
 
+/*
+ * \retval number of frames available to the hardware for playback
+ *
+ * ie. the filled part of the ring buffer
+ */
 static inline snd_pcm_sframes_t snd_pcm_mmap_playback_hw_avail(snd_pcm_t *pcm)
 {
 	return pcm->buffer_size - snd_pcm_mmap_playback_avail(pcm);
 }
 
+/*
+ * \retval number of frames available to the hardware for capture
+ *
+ * ie. the empty part of the ring buffer.
+ */
 static inline snd_pcm_sframes_t snd_pcm_mmap_capture_hw_avail(snd_pcm_t *pcm)
 {
 	return pcm->buffer_size - snd_pcm_mmap_capture_avail(pcm);
@@ -582,14 +608,20 @@ static inline snd_pcm_uframes_t snd_pcm_mmap_hw_offset(snd_pcm_t *pcm)
 	return *pcm->hw.ptr % pcm->buffer_size;
 }
 
+/*
+ * \retval number of frames pending from application to hardware
+ */
 static inline snd_pcm_uframes_t snd_pcm_mmap_playback_delay(snd_pcm_t *pcm)
 {
 	return snd_pcm_mmap_playback_hw_avail(pcm);
 }
 
+/*
+ * \retval number of frames pending from hardware to application
+ */
 static inline snd_pcm_uframes_t snd_pcm_mmap_capture_delay(snd_pcm_t *pcm)
 {
-	return snd_pcm_mmap_capture_hw_avail(pcm);
+	return snd_pcm_mmap_capture_avail(pcm);
 }
 
 static inline snd_pcm_sframes_t snd_pcm_mmap_delay(snd_pcm_t *pcm)
@@ -598,19 +630,6 @@ static inline snd_pcm_sframes_t snd_pcm_mmap_delay(snd_pcm_t *pcm)
 		return snd_pcm_mmap_playback_delay(pcm);
 	else
 		return snd_pcm_mmap_capture_delay(pcm);
-}
-
-static inline void *snd_pcm_channel_area_addr(const snd_pcm_channel_area_t *area, snd_pcm_uframes_t offset)
-{
-	unsigned int bitofs = area->first + area->step * offset;
-	assert(bitofs % 8 == 0);
-	return (char *) area->addr + bitofs / 8;
-}
-
-static inline unsigned int snd_pcm_channel_area_step(const snd_pcm_channel_area_t *area)
-{
-	assert(area->step % 8 == 0);
-	return area->step / 8;
 }
 
 static inline snd_pcm_sframes_t _snd_pcm_writei(snd_pcm_t *pcm, const void *buffer, snd_pcm_uframes_t size)
@@ -1139,6 +1158,26 @@ static inline void sw_set_period_event(snd_pcm_sw_params_t *params, int val)
 }
 
 #define PCMINABORT(pcm) (((pcm)->mode & SND_PCM_ABORT) != 0)
+
+static inline snd_pcm_sframes_t pcm_frame_diff(snd_pcm_uframes_t ptr1,
+					       snd_pcm_uframes_t ptr2,
+					       snd_pcm_uframes_t boundary)
+{
+	if (ptr1 < ptr2)
+		return ptr1 + (boundary - ptr2);
+	else
+		return ptr1 - ptr2;
+}
+
+static inline snd_pcm_sframes_t pcm_frame_diff2(snd_pcm_uframes_t ptr1,
+						snd_pcm_uframes_t ptr2,
+						snd_pcm_uframes_t boundary)
+{
+	snd_pcm_sframes_t r = ptr1 - ptr2;
+	if (r >= (snd_pcm_sframes_t)boundary / 2)
+		return boundary - r;
+	return r;
+}
 
 #ifdef THREAD_SAFE_API
 /*

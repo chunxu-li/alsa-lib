@@ -33,17 +33,20 @@
 
 /* Function to convert from percentage to volume. val = percentage */
 
-#ifdef HAVE_SOFT_FLOAT
-static inline long int convert_prange1(long val, long min, long max)
+static inline long int convert_prange1(long perc, long min, long max)
 {
-	long temp = val * (max - min);
-	return temp / 100 + min + ((temp % 100) == 0 ? 0 : 1);
-}
-#else
+	long tmp;
 
-#define convert_prange1(val, min, max) \
-	ceil((val) * ((max) - (min)) * 0.01 + (min))
+#ifdef HAVE_SOFT_FLOAT
+	tmp = perc * (max - min);
+	tmp = tmp / 100 + ((tmp % 100) < 50 ? 0 : 1);
+#else
+	tmp = rint((double)perc * (double)(max - min) * 0.01);
 #endif
+	if (tmp == 0 && perc > 0)
+		tmp++;
+	return tmp + min;
+}
 
 #define check_range(val, min, max) \
 	((val < min) ? (min) : ((val > max) ? (max) : (val)))
@@ -113,14 +116,19 @@ static long long get_integer64(const char **ptr, long long min, long long max)
  */
 char *snd_ctl_ascii_elem_id_get(snd_ctl_elem_id_t *id)
 {
-	unsigned int index, device, subdevice;
+	unsigned int numid, index, device, subdevice;
 	char buf[256], buf1[32];
+	const char *iface;
 
-	snprintf(buf, sizeof(buf), "numid=%u,iface=%s,name='%s'",
-				snd_ctl_elem_id_get_numid(id),
-				snd_ctl_elem_iface_name(
-					snd_ctl_elem_id_get_interface(id)),
-				snd_ctl_elem_id_get_name(id));
+	numid = snd_ctl_elem_id_get_numid(id);
+	iface = snd_ctl_elem_iface_name(snd_ctl_elem_id_get_interface(id));
+	if (numid > 0) {
+		snprintf(buf, sizeof(buf), "numid=%u,iface=%s,name='%s'",
+				numid, iface, snd_ctl_elem_id_get_name(id));
+	} else {
+		snprintf(buf, sizeof(buf), "iface=%s,name='%s'",
+				iface, snd_ctl_elem_id_get_name(id));
+	}
 	buf[sizeof(buf)-1] = '\0';
 	index = snd_ctl_elem_id_get_index(id);
 	device = snd_ctl_elem_id_get_device(id);
@@ -279,26 +287,49 @@ static int get_ctl_enum_item_index(snd_ctl_t *handle,
 	if (items <= 0)
 		return -1;
 
+	end = *ptr;
+	if (end == '\'' || end == '"')
+		ptr++;
+	else
+		end = '\0';
+
 	for (i = 0; i < items; i++) {
 		snd_ctl_elem_info_set_item(info, i);
 		if (snd_ctl_elem_info(handle, info) < 0)
 			return -1;
 		name = snd_ctl_elem_info_get_item_name(info);
-		end = *ptr;
-		if (end == '\'' || end == '"')
-			ptr++;
-		else
-			end = '\0';
 		len = strlen(name);
-		if (strncmp(name, ptr, len) == 0) {
-			if (ptr[len] == end || ptr[len] == ',' || ptr[len] == '\n') {
-				ptr += len;
-				*ptrp = ptr;
-				return i;
-			}
+		if (strncmp(name, ptr, len))
+			continue;
+		if (end == '\0' && (ptr[len] == '\0' || ptr[len] == ',' || ptr[len] == '\n')) {
+			*ptrp = ptr + len;
+			return i;
+		}
+		if (end != '\0' && ptr[len] == end) {
+			*ptrp = ptr + len + 1;
+			return i;
 		}
 	}
 	return -1;
+}
+
+static unsigned int get_ctl_type_max_elements(snd_ctl_elem_type_t type)
+{
+	struct snd_ctl_elem_value value;
+
+	switch (type) {
+	case SND_CTL_ELEM_TYPE_BOOLEAN:
+	case SND_CTL_ELEM_TYPE_INTEGER:
+		return ARRAY_SIZE(value.value.integer.value);
+	case SND_CTL_ELEM_TYPE_INTEGER64:
+		return ARRAY_SIZE(value.value.integer64.value);
+	case SND_CTL_ELEM_TYPE_ENUMERATED:
+		return ARRAY_SIZE(value.value.enumerated.item);
+	case SND_CTL_ELEM_TYPE_BYTES:
+		return ARRAY_SIZE(value.value.bytes.data);
+	default:
+		return 0;
+	}
 }
 
 /**
@@ -328,8 +359,11 @@ int snd_ctl_ascii_value_parse(snd_ctl_t *handle,
 	type = snd_ctl_elem_info_get_type(info);
 	count = snd_ctl_elem_info_get_count(info);
 	snd_ctl_elem_value_set_id(dst, &myid);
+
+	if (count > get_ctl_type_max_elements(type))
+		count = get_ctl_type_max_elements(type);
 	
-	for (idx = 0; idx < count && idx < 128 && ptr && *ptr; idx++) {
+	for (idx = 0; idx < count && ptr && *ptr; idx++) {
 		if (*ptr == ',')
 			goto skip;
 		switch (type) {

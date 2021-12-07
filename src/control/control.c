@@ -31,32 +31,135 @@
 /*! \page control Control interface
 
 <P>Control interface is designed to access primitive controls. There is
-also interface notifying about control and structure changes.
+also an interface for notifying about control and structure changes.
+
 
 \section control_general_overview General overview
+
+In Alsa, there are physical sound cards, such as USB headsets, and
+virtual sound cards, such as "pulse", which represents the PulseAudio
+Sound system. Each sound card offers a control interface, making its
+settings (e.g. volume knobs) available. The complete list of available
+control interfaces can be obtained using snd_device_name_hint(),
+giving -1 as card index and "ctl" as interface type. Each returned
+NAME hint identifies a control interface.
+
+Sound cards have an ID (a string), an index (an int, sometimes called
+the "card number"), a name, a longname, a mixername and a "components"
+property. The file /proc/asound/cards lists most of these properties
+for physical sound cards. Virtual sound cards are not listed in that
+file. The format is:
+
+\verbatim
+index [ID     ] Driver - name
+                longname
+\endverbatim
+
+Note that the mixername and components are not listed.
+
+
+\subsection control_cards_id Identifying and Opening Control Interfaces
+
+To work with a control interface, is must be opened first, using
+snd_ctl_open(). This function takes the interface name.
+
+For physical sound cards, the control interface can be identified
+using the string "hw:<index>" (e.g. `hw:2`). The NAME hint - which is
+"hw:CARD=<ID>" - can also be used. Further, its device file (something
+like `/dev/snd/controlC0`) is also acceptable. Either of them can be
+given to snd_ctl_open().
+
+For virtual sound cards, the NAME hint is given to snd_ctl_open().
+
+The functions snd_card_get_index(), snd_card_get_name() and
+snd_card_get_longname() can be used to find an identifying property
+when another one is already known.
+
+\section control_elements Elements
 
 In ALSA control feature, each sound card can have control elements. The elements
 are managed according to below model.
 
- - element set
+ - Element set
+
    - A set of elements with the same attribute (i.e. name, get/put operations).
      Some element sets can be added to a sound card by drivers in kernel and
      userspace applications.
- - element
-   - An element can be identified by userspace applications. Each element has
-     own identical information.
- - member
-   - An element includes some members to have a value. The value of each member
-     can be changed by both of userspace applications and drivers in kernel.
 
-Each element can be identified by two ways; a combination of name and index, or
-numerical number (numid).
+ - Element
 
-The type of element set is one of integer, integerr64, boolean, enumerators,
+   - A control element might be a master volume control, for example, or a
+     read-only indicator, such as a sync status. An element has a type (e.g.
+     SNDRV_CTL_ELEM_TYPE_INTEGER or SNDRV_CTL_ELEM_TYPE_BOOLEAN) and - depending
+     on the type - min/max values, a step size, a set of possible values (for
+     enums), etc.
+
+ - Member
+
+   - An element usually includes one or more member(s) to have a value. For
+     example, a stereo volume control element has two members (for left/right),
+     while a mono volume has only one member. The member count can be obtained
+     using snd_ctl_elem_info_get_count(). Elements of type
+     "SNDRV_CTL_ELEM_TYPE_BYTES" or "SNDRV_CTL_ELEM_TYPE_IEC958" have no members
+     at all (and thus no member count), they have just a single value. The
+     members share the same properties (e.g. both volume control members have
+     the same min/max values). The value of each member can be changed by both
+     of userspace applications and drivers in kernel.
+
+
+\subsection identifying_elements Identifying Elements
+
+Each element has the following identifying properties:
+
+  - The numid (a numeric identifier, assigned when the sound card is
+    detected, constant while the sound card is kept connected)
+  - The interface type (e.g. MIXER, CARD or PCM)
+  - The device
+  - The subdevice
+  - Its name
+  - Its index
+
+An element can be identified either by its short numid or by the full
+set of fields (interface type, device, subdevice, name, index).
+This set of fields is always the same (driver updates can change it,
+but in practice this is rare). The numid can change on each boot.
+In case of an USB sound card, the numid can also change when it
+is reconnected. The short numid is used to reduce the lookup time.
+
+\subsection element_lists Element Lists
+
+An element list can be used to obtain a list of all elements of the
+sound card. The list contains generic information (e.g. how many
+elements the card has), and the identifying properties of the elements
+(numid, card, name, ...). See #snd_ctl_elem_list_t to learn more about
+element lists.
+
+
+\subsection working_with_elements Working with Elements
+
+It is possible to obtain information about an element using the
+snd_ctl_elem_info_*() functions. For enums, the allowed values can be
+obtained, for integers, the min/max values can be obtained, and so
+on. In addition, these functions can report the identifying
+properties. E.g. when the element is addressed using its numid, the
+functions complements the name, index, etc.
+
+To access the members (i.e. values) of a control, use the
+snd_ctl_elem_value*() functions.  These allow to get and set the
+actual values or settings. It is also possible to get and set the ID
+values (such as the numid or the name).
+
+
+\subsection element_sets Element Sets
+
+The type of element set is one of integer, integer64, boolean, enumerators,
 bytes and IEC958 structure. This indicates the type of value for each member in
 elements included in the element set.
 
-When the value of member is changed, corresponding events are transferred to
+
+\section events Events
+
+When the value of a member is changed, corresponding events are transferred to
 userspace applications. The applications should subscribe any events in advance.
 
 \section tlv_blob Supplemental data for elements in an element set
@@ -92,6 +195,7 @@ against the original design.
 #include <signal.h>
 #include <poll.h>
 #include <stdbool.h>
+#include <limits.h>
 #include "control_local.h"
 
 /**
@@ -267,10 +371,15 @@ int snd_ctl_subscribe_events(snd_ctl_t *ctl, int subscribe)
 
 
 /**
- * \brief Get card related information
- * \param ctl CTL handle
- * \param info Card info pointer
- * \return 0 on success otherwise a negative error code
+ * \brief Get information about the sound card.
+ *
+ * Obtain information about the sound card previously opened using
+ * snd_ctl_open(). The object "info" must be allocated prior to calling this
+ * function. See snd_ctl_card_info_t for details.
+ *
+ * \param ctl The CTL handle.
+ * \param info The card information is stored here.
+ * \return 0 on success, otherwise a negative error code.
  */
 int snd_ctl_card_info(snd_ctl_t *ctl, snd_ctl_card_info_t *info)
 {
@@ -280,6 +389,21 @@ int snd_ctl_card_info(snd_ctl_t *ctl, snd_ctl_card_info_t *info)
 
 /**
  * \brief Get a list of element identifiers
+ *
+ * Before calling this function, memoru must be allocated using
+ * snd_ctl_elem_list_malloc().
+ *
+ * This function obtains data from the sound card driver and puts it
+ * into the list.
+ *
+ * If there was space allocated for the element identifiers (using
+ * snd_ctl_elem_list_alloc_space()), information will be filled in. If
+ * too little space was allocated, only a part of the elements will be
+ * queried. If there was too much space allocated, some of it remains
+ * unused. Use snd_ctl_elem_list_get_count() and
+ * snd_ctl_elem_list_get_used() to obtain information about space
+ * usage. See #snd_ctl_elem_list_t to learn more.
+ *
  * \param ctl CTL handle
  * \param list CTL element identifiers list pointer
  * \return 0 on success otherwise a negative error code
@@ -333,10 +457,55 @@ static bool validate_element_member_dimension(snd_ctl_elem_info_t *info)
 #define validate_element_member_dimension(info)		true
 #endif /* deprecated */
 
+#define USER_ACCESS_DEFAULT (\
+	SNDRV_CTL_ELEM_ACCESS_READWRITE |\
+	SNDRV_CTL_ELEM_ACCESS_TLV_READWRITE |\
+	SNDRV_CTL_ELEM_ACCESS_USER)
+
+#define USER_ACCESS_SETTABLE (\
+	SNDRV_CTL_ELEM_ACCESS_READWRITE |\
+	SNDRV_CTL_ELEM_ACCESS_VOLATILE |\
+	SNDRV_CTL_ELEM_ACCESS_TLV_READWRITE |\
+	SNDRV_CTL_ELEM_ACCESS_INACTIVE |\
+	SNDRV_CTL_ELEM_ACCESS_USER)
+
+static inline int set_user_access(snd_ctl_elem_info_t *info)
+{
+	if (info->access == 0) {
+		info->access = USER_ACCESS_DEFAULT;
+	} else {
+		if ((info->access & SNDRV_CTL_ELEM_ACCESS_READWRITE) == 0)
+			return -1;
+		if (info->access & ~USER_ACCESS_SETTABLE)
+			return -1;
+		info->access |= SNDRV_CTL_ELEM_ACCESS_USER;
+	}
+	return 0;
+}
+
+int __snd_ctl_add_elem_set(snd_ctl_t *ctl, snd_ctl_elem_info_t *info,
+			   unsigned int element_count,
+			   unsigned int member_count)
+{
+	if (ctl == NULL || info->id.name[0] == '\0')
+		return -EINVAL;
+
+	if (set_user_access(info))
+		return -EINVAL;
+
+	info->owner = element_count;
+	info->count = member_count;
+
+	if (!validate_element_member_dimension(info))
+		return -EINVAL;
+
+	return ctl->ops->element_add(ctl, info);
+}
+
 /**
  * \brief Create and add some user-defined control elements of integer type.
  * \param ctl A handle of backend module for control interface.
- * \param info Common iformation for a new element set, with ID of the first new
+ * \param info Common information for a new element set, with ID of the first new
  *	       element.
  * \param element_count The number of elements added by this operation.
  * \param member_count The number of members which a element has to
@@ -386,23 +555,15 @@ int snd_ctl_add_integer_elem_set(snd_ctl_t *ctl, snd_ctl_elem_info_t *info,
 	unsigned int numid;
 	int err;
 
-	if (ctl == NULL || info == NULL || info->id.name[0] == '\0')
+	if (info == NULL)
 		return -EINVAL;
 
 	info->type = SND_CTL_ELEM_TYPE_INTEGER;
-	info->access = SNDRV_CTL_ELEM_ACCESS_READWRITE |
-		       SNDRV_CTL_ELEM_ACCESS_TLV_READWRITE |
-		       SNDRV_CTL_ELEM_ACCESS_USER;
-	info->owner = element_count;
-	info->count = member_count;
 	info->value.integer.min = min;
 	info->value.integer.max = max;
 	info->value.integer.step = step;
 
-	if (!validate_element_member_dimension(info))
-		return -EINVAL;
-
-	err = ctl->ops->element_add(ctl, info);
+	err = __snd_ctl_add_elem_set(ctl, info, element_count, member_count);
 	if (err < 0)
 		return err;
 	numid = snd_ctl_elem_id_get_numid(&info->id);
@@ -426,7 +587,7 @@ int snd_ctl_add_integer_elem_set(snd_ctl_t *ctl, snd_ctl_elem_info_t *info,
 /**
  * \brief Create and add some user-defined control elements of integer64 type.
  * \param ctl A handle of backend module for control interface.
- * \param info Common iformation for a new element set, with ID of the first new
+ * \param info Common information for a new element set, with ID of the first new
  *	       element.
  * \param element_count The number of elements added by this operation.
  * \param member_count The number of members which a element has to
@@ -476,23 +637,15 @@ int snd_ctl_add_integer64_elem_set(snd_ctl_t *ctl, snd_ctl_elem_info_t *info,
 	unsigned int numid;
 	int err;
 
-	if (ctl == NULL || info == NULL || info->id.name[0] == '\0')
+	if (info == NULL)
 		return -EINVAL;
 
 	info->type = SND_CTL_ELEM_TYPE_INTEGER64;
-	info->access = SNDRV_CTL_ELEM_ACCESS_READWRITE |
-		       SNDRV_CTL_ELEM_ACCESS_TLV_READWRITE |
-		       SNDRV_CTL_ELEM_ACCESS_USER;
-	info->owner = element_count;
-	info->count = member_count;
 	info->value.integer64.min = min;
 	info->value.integer64.max = max;
 	info->value.integer64.step = step;
 
-	if (!validate_element_member_dimension(info))
-		return -EINVAL;
-
-	err = ctl->ops->element_add(ctl, info);
+	err = __snd_ctl_add_elem_set(ctl, info, element_count, member_count);
 	if (err < 0)
 		return err;
 	numid = snd_ctl_elem_id_get_numid(&info->id);
@@ -516,7 +669,7 @@ int snd_ctl_add_integer64_elem_set(snd_ctl_t *ctl, snd_ctl_elem_info_t *info,
 /**
  * \brief Create and add some user-defined control elements of boolean type.
  * \param ctl A handle of backend module for control interface.
- * \param info Common iformation for a new element set, with ID of the first new
+ * \param info Common information for a new element set, with ID of the first new
  *	       element.
  * \param element_count The number of elements added by this operation.
  * \param member_count The number of members which a element has to
@@ -555,28 +708,20 @@ int snd_ctl_add_boolean_elem_set(snd_ctl_t *ctl, snd_ctl_elem_info_t *info,
 				 unsigned int element_count,
 				 unsigned int member_count)
 {
-	if (ctl == NULL || info == NULL || info->id.name[0] == '\0')
+	if (info == NULL)
 		return -EINVAL;
 
 	info->type = SND_CTL_ELEM_TYPE_BOOLEAN;
-	info->access = SNDRV_CTL_ELEM_ACCESS_READWRITE |
-		       SNDRV_CTL_ELEM_ACCESS_TLV_READWRITE |
-		       SNDRV_CTL_ELEM_ACCESS_USER;
-	info->owner = element_count;
-	info->count = member_count;
 	info->value.integer.min = 0;
 	info->value.integer.max = 1;
 
-	if (!validate_element_member_dimension(info))
-		return -EINVAL;
-
-	return ctl->ops->element_add(ctl, info);
+	return __snd_ctl_add_elem_set(ctl, info, element_count, member_count);
 }
 
 /**
  * \brief Create and add some user-defined control elements of enumerated type.
  * \param ctl A handle of backend module for control interface.
- * \param info Common iformation for a new element set, with ID of the first new
+ * \param info Common information for a new element set, with ID of the first new
  *	       element.
  * \param element_count The number of elements added by this operation.
  * \param member_count The number of members which a element has to
@@ -626,14 +771,10 @@ int snd_ctl_add_enumerated_elem_set(snd_ctl_t *ctl, snd_ctl_elem_info_t *info,
 	char *buf, *p;
 	int err;
 
-	if (ctl == NULL || info == NULL || info->id.name[0] == '\0' ||
-	    labels == NULL)
+	if (info == NULL || labels == NULL)
 		return -EINVAL;
 
 	info->type = SND_CTL_ELEM_TYPE_ENUMERATED;
-	info->access = SNDRV_CTL_ELEM_ACCESS_READWRITE |
-		       SNDRV_CTL_ELEM_ACCESS_TLV_READWRITE |
-		       SNDRV_CTL_ELEM_ACCESS_USER;
 	info->owner = element_count;
 	info->count = member_count;
 	info->value.enumerated.items = items;
@@ -654,10 +795,7 @@ int snd_ctl_add_enumerated_elem_set(snd_ctl_t *ctl, snd_ctl_elem_info_t *info,
 		p += strlen(labels[i]) + 1;
 	}
 
-	if (!validate_element_member_dimension(info))
-		return -EINVAL;
-
-	err = ctl->ops->element_add(ctl, info);
+	err = __snd_ctl_add_elem_set(ctl, info, element_count, member_count);
 
 	free(buf);
 
@@ -667,7 +805,7 @@ int snd_ctl_add_enumerated_elem_set(snd_ctl_t *ctl, snd_ctl_elem_info_t *info,
 /**
  * \brief Create and add some user-defined control elements of bytes type.
  * \param ctl A handle of backend module for control interface.
- * \param info Common iformation for a new element set, with ID of the first new
+ * \param info Common information for a new element set, with ID of the first new
  *	       element.
  * \param element_count The number of elements added by this operation.
  * \param member_count The number of members which a element has to
@@ -707,20 +845,12 @@ int snd_ctl_add_bytes_elem_set(snd_ctl_t *ctl, snd_ctl_elem_info_t *info,
 			       unsigned int element_count,
 			       unsigned int member_count)
 {
-	if (ctl == NULL || info == NULL || info->id.name[0] == '\0')
+	if (info == NULL)
 		return -EINVAL;
 
 	info->type = SND_CTL_ELEM_TYPE_BYTES;
-	info->access = SNDRV_CTL_ELEM_ACCESS_READWRITE |
-		       SNDRV_CTL_ELEM_ACCESS_TLV_READWRITE |
-		       SNDRV_CTL_ELEM_ACCESS_USER;
-	info->owner = element_count;
-	info->count = member_count;
 
-	if (!validate_element_member_dimension(info))
-		return -EINVAL;
-
-	return ctl->ops->element_add(ctl, info);
+	return __snd_ctl_add_elem_set(ctl, info, element_count, member_count);
 }
 
 /**
@@ -862,10 +992,19 @@ int snd_ctl_elem_remove(snd_ctl_t *ctl, snd_ctl_elem_id_t *id)
 }
 
 /**
- * \brief Get CTL element value
- * \param ctl CTL handle
- * \param data Data of an element.
- * \return 0 on success otherwise a negative error code
+ * \brief Get CTL element value.
+ *
+ * Read information from sound card. You must set the ID of the
+ * element before calling this function.
+ *
+ * See snd_ctl_elem_value_t for details.
+ *
+ * \param ctl CTL handle.
+ * \param data The element value. The ID must be set before calling
+ *             the function, and the actual value will be returned
+ *             here.
+ *
+ * \return 0 on success otherwise a negative error code.
  */
 int snd_ctl_elem_read(snd_ctl_t *ctl, snd_ctl_elem_value_t *data)
 {
@@ -874,9 +1013,16 @@ int snd_ctl_elem_read(snd_ctl_t *ctl, snd_ctl_elem_value_t *data)
 }
 
 /**
- * \brief Set CTL element value
- * \param ctl CTL handle
- * \param data Data of an element.
+ * \brief Set CTL element value.
+ *
+ * Write new value(s) to the sound card. You must set the ID and the
+ * value of the element before calling this function.
+ *
+ * See snd_ctl_elem_value_t for details.
+ *
+ * \param ctl CTL handle.
+ * \param data The new value.
+ *
  * \retval 0 on success
  * \retval >0 on success when value was changed
  * \retval <0 a negative error code
@@ -1246,7 +1392,7 @@ snd_ctl_t *snd_async_handler_get_ctl(snd_async_handler_t *handler)
 }
 
 static const char *const build_in_ctls[] = {
-	"hw", "shm", NULL
+	"hw", "empty", "remap", "shm", NULL
 };
 
 static int snd_ctl_open_conf(snd_ctl_t **ctlp, const char *name,
@@ -1337,13 +1483,13 @@ static int snd_ctl_open_conf(snd_ctl_t **ctlp, const char *name,
 			build_in++;
 		}
 		if (*build_in == NULL) {
-			buf1 = malloc(strlen(str) + sizeof(ALSA_PLUGIN_DIR) + 32);
+			buf1 = malloc(strlen(str) + 32);
 			if (buf1 == NULL) {
 				err = -ENOMEM;
 				goto _err;
 			}
 			lib = buf1;
-			sprintf(buf1, "%s/libasound_module_ctl_%s.so", ALSA_PLUGIN_DIR, str);
+			sprintf(buf1, "libasound_module_ctl_%s.so", str);
 		}
 	}
 #ifndef PIC
@@ -1370,26 +1516,52 @@ static int snd_ctl_open_conf(snd_ctl_t **ctlp, const char *name,
 	return err;
 }
 
-static int snd_ctl_open_noupdate(snd_ctl_t **ctlp, snd_config_t *root, const char *name, int mode)
+static int snd_ctl_open_noupdate(snd_ctl_t **ctlp, snd_config_t *root,
+				 const char *name, int mode, int hop)
 {
 	int err;
 	snd_config_t *ctl_conf;
+	const char *str;
+
 	err = snd_config_search_definition(root, "ctl", name, &ctl_conf);
 	if (err < 0) {
 		SNDERR("Invalid CTL %s", name);
 		return err;
 	}
-	err = snd_ctl_open_conf(ctlp, name, root, ctl_conf, mode);
+	if (snd_config_get_string(ctl_conf, &str) >= 0)
+		err = snd_ctl_open_noupdate(ctlp, root, str, mode, hop + 1);
+	else {
+		snd_config_set_hop(ctl_conf, hop);
+		err = snd_ctl_open_conf(ctlp, name, root, ctl_conf, mode);
+	}
 	snd_config_delete(ctl_conf);
 	return err;
 }
 
+#ifndef DOC_HIDDEN
+int _snd_ctl_open_named_child(snd_ctl_t **pctl, const char *name,
+			      snd_config_t *root, snd_config_t *conf,
+			      int mode, snd_config_t *parent_conf)
+{
+	const char *str;
+	int hop;
+
+	if ((hop = snd_config_check_hop(parent_conf)) < 0)
+		return hop;
+	if (snd_config_get_string(conf, &str) >= 0)
+		return snd_ctl_open_noupdate(pctl, root, str, mode, hop + 1);
+	return snd_ctl_open_conf(pctl, name, root, conf, mode);
+}
+#endif
+
 /**
- * \brief Opens a CTL
- * \param ctlp Returned CTL handle
- * \param name ASCII identifier of the CTL handle
- * \param mode Open mode (see #SND_CTL_NONBLOCK, #SND_CTL_ASYNC)
- * \return 0 on success otherwise a negative error code
+ * \brief Opens a sound card.
+ *
+ * \param ctlp Returned CTL handle.
+ * \param name A string identifying the card (See \ref control_cards_id).
+ * \param mode Open mode (see #SND_CTL_NONBLOCK, #SND_CTL_ASYNC).
+ *
+ * \return 0 on success otherwise a negative error code.
  */
 int snd_ctl_open(snd_ctl_t **ctlp, const char *name, int mode)
 {
@@ -1397,10 +1569,16 @@ int snd_ctl_open(snd_ctl_t **ctlp, const char *name, int mode)
 	int err;
 
 	assert(ctlp && name);
-	err = snd_config_update_ref(&top);
-	if (err < 0)
-		return err;
-	err = snd_ctl_open_noupdate(ctlp, top, name, mode);
+	if (_snd_is_ucm_device(name)) {
+		name = uc_mgr_alibcfg_by_device(&top, name);
+		if (name == NULL)
+			return -ENODEV;
+	} else {
+		err = snd_config_update_ref(&top);
+		if (err < 0)
+			return err;
+	}
+	err = snd_ctl_open_noupdate(ctlp, top, name, mode, 0);
 	snd_config_unref(top);
 	return err;
 }
@@ -1417,7 +1595,7 @@ int snd_ctl_open_lconf(snd_ctl_t **ctlp, const char *name,
 		       int mode, snd_config_t *lconf)
 {
 	assert(ctlp && name && lconf);
-	return snd_ctl_open_noupdate(ctlp, lconf, name, mode);
+	return snd_ctl_open_noupdate(ctlp, lconf, name, mode, 0);
 }
 
 /**
@@ -1434,7 +1612,7 @@ int snd_ctl_open_fallback(snd_ctl_t **ctlp, snd_config_t *root,
 {
 	int err;
 	assert(ctlp && name && root);
-	err = snd_ctl_open_noupdate(ctlp, root, name, mode);
+	err = snd_ctl_open_noupdate(ctlp, root, name, mode, 0);
 	if (err >= 0) {
 		free((*ctlp)->name);
 		(*ctlp)->name = orig_name ? strdup(orig_name) : NULL;
@@ -1508,9 +1686,14 @@ const char *snd_ctl_event_type_name(snd_ctl_event_type_t type)
 
 /**
  * \brief allocate space for CTL element identifiers list
- * \param obj CTL element identifiers list
- * \param entries Entries to allocate
- * \return 0 on success otherwise a negative error code
+ *
+ * The space can be released with snd_ctl_elem_list_free_space().
+ *
+ * \param obj CTL element identifiers list.
+ * \param entries How many entries to allocate. See
+ *        #snd_ctl_elem_list_t to learn how to obtain
+ *        this number in advance.
+ * \return 0 on success otherwise a negative error code.
  */
 int snd_ctl_elem_list_alloc_space(snd_ctl_elem_list_t *obj, unsigned int entries)
 {
@@ -1526,6 +1709,10 @@ int snd_ctl_elem_list_alloc_space(snd_ctl_elem_list_t *obj, unsigned int entries
 
 /**
  * \brief free previously allocated space for CTL element identifiers list
+ *
+ * Releases space previously allocated using
+ * snd_ctl_elem_list_alloc_space().
+ *
  * \param obj CTL element identifiers list
  */
 void snd_ctl_elem_list_free_space(snd_ctl_elem_list_t *obj)
@@ -1692,6 +1879,71 @@ void snd_ctl_elem_id_copy(snd_ctl_elem_id_t *dst, const snd_ctl_elem_id_t *src)
 }
 
 /**
+ * \brief compare one #snd_ctl_elem_id_t to another using numid
+ * \param id1 pointer to first id
+ * \param id2 pointer to second id
+ * \retval zero when values are identical, other value on a difference (like strcmp)
+ *
+ * This comparison ignores the set of fields part.
+ *
+ * The return value can be used for sorting like qsort(). It gives persistent
+ * results.
+ */
+int snd_ctl_elem_id_compare_numid(const snd_ctl_elem_id_t *id1, const snd_ctl_elem_id_t *id2)
+{
+	int64_t d;
+
+	assert(id1 && id2);
+	d = (int64_t)id1->numid - (int64_t)id2->numid;
+	if (d & ((int64_t)INT_MAX + 1)) {	/* fast path */
+		if (d > INT_MAX)
+			d = INT_MAX;
+		else if (d < INT_MIN)
+			d = INT_MIN;
+	}
+	return d;
+}
+
+/**
+ * \brief compare one #snd_ctl_elem_id_t to another
+ * \param id1 pointer to first id
+ * \param id2 pointer to second id
+ * \retval zero when values are identical, other value on a difference (like strcmp)
+ *
+ * This comparison ignores the numid part. The numid comparison can be easily
+ * implemented using snd_ctl_elem_id_get_numid() calls.
+ *
+ * The identifier set fields are compared in this order: interface, device,
+ * subdevice, name, index.
+ *
+ * The return value can be used for sorting like qsort(). It gives persistent
+ * results.
+ */
+int snd_ctl_elem_id_compare_set(const snd_ctl_elem_id_t *id1, const snd_ctl_elem_id_t *id2)
+{
+	int d;
+
+	assert(id1 && id2);
+	/* although those values are unsigned integer, practically, */
+	/* the useable limit is really much lower */
+	assert((id1->iface | id1->device | id1->subdevice | id1->index) <= INT_MAX);
+	assert((id2->iface | id2->device | id2->subdevice | id1->index) <= INT_MAX);
+	d = id1->iface - id2->iface;
+	if (d != 0)
+		return d;
+	d = id1->device - id2->device;
+	if (d != 0)
+		return d;
+	d = id1->subdevice - id2->subdevice;
+	if (d != 0)
+		return d;
+	d = strcmp((const char *)id1->name, (const char *)id2->name);
+	if (d != 0)
+		return d;
+	return id1->index - id2->index;
+}
+
+/**
  * \brief Get numeric identifier from a CTL element identifier
  * \param obj CTL element identifier
  * \return CTL element numeric identifier
@@ -1824,8 +2076,8 @@ void snd_ctl_elem_id_set_index(snd_ctl_elem_id_t *obj, unsigned int val)
 }
 
 /**
- * \brief get size of #snd_ctl_card_info_t
- * \return size in bytes
+ * \brief get size of #snd_ctl_card_info_t.
+ * \return Size in bytes.
  */
 size_t snd_ctl_card_info_sizeof()
 {
@@ -1833,9 +2085,16 @@ size_t snd_ctl_card_info_sizeof()
 }
 
 /**
- * \brief allocate an invalid #snd_ctl_card_info_t using standard malloc
- * \param ptr returned pointer
- * \return 0 on success otherwise negative error code
+ * \brief Allocate an invalid #snd_ctl_card_info_t on the heap.
+ *
+ * Allocate space for a card info object on the heap. The allocated memory
+ * must be freed using snd_ctl_card_info_free().
+ *
+ * See snd_ctl_card_info_t for details.
+ *
+ * \param ptr Pointer to a snd_ctl_card_info_t pointer. The address
+ *            of the allocated space will be returned here.
+ * \return 0 on success, otherwise a negative error code.
  */
 int snd_ctl_card_info_malloc(snd_ctl_card_info_t **ptr)
 {
@@ -1847,8 +2106,10 @@ int snd_ctl_card_info_malloc(snd_ctl_card_info_t **ptr)
 }
 
 /**
- * \brief frees a previously allocated #snd_ctl_card_info_t
- * \param obj pointer to object to free
+ * \brief Free an #snd_ctl_card_info_t previously allocated using
+ *        snd_ctl_card_info_malloc().
+ *
+ * \param obj Pointer to the snd_ctl_card_info_t.
  */
 void snd_ctl_card_info_free(snd_ctl_card_info_t *obj)
 {
@@ -1856,8 +2117,11 @@ void snd_ctl_card_info_free(snd_ctl_card_info_t *obj)
 }
 
 /**
- * \brief clear given #snd_ctl_card_info_t object
- * \param obj pointer to object to clear
+ * \brief Clear given card info object.
+ *
+ * See snd_ctl_elem_value_t for details.
+ *
+ * \param obj Card info object.
  */
 void snd_ctl_card_info_clear(snd_ctl_card_info_t *obj)
 {
@@ -1865,9 +2129,10 @@ void snd_ctl_card_info_clear(snd_ctl_card_info_t *obj)
 }
 
 /**
- * \brief copy one #snd_ctl_card_info_t to another
- * \param dst pointer to destination
- * \param src pointer to source
+ * \brief Bitwise copy of a #snd_ctl_card_info_t object.
+ *
+ * \param dst Pointer to destination.
+ * \param src Pointer to source.
  */
 void snd_ctl_card_info_copy(snd_ctl_card_info_t *dst, const snd_ctl_card_info_t *src)
 {
@@ -1876,9 +2141,12 @@ void snd_ctl_card_info_copy(snd_ctl_card_info_t *dst, const snd_ctl_card_info_t 
 }
 
 /**
- * \brief Get card number from a CTL card info
- * \param obj CTL card info
- * \return card number
+ * \brief Get the sound card index from the given info object.
+ *
+ * See snd_ctl_card_info_t for more details.
+ *
+ * \param obj The card info object.
+ * \return Sound card index.
  */
 int snd_ctl_card_info_get_card(const snd_ctl_card_info_t *obj)
 {
@@ -1887,9 +2155,12 @@ int snd_ctl_card_info_get_card(const snd_ctl_card_info_t *obj)
 }
 
 /**
- * \brief Get card identifier from a CTL card info
- * \param obj CTL card info
- * \return card identifier
+ * \brief Get the sound card ID from the given info object.
+ *
+ * See snd_ctl_card_info_t for more details.
+ *
+ * \param obj The card info object.
+ * \return Sound card ID.
  */
 const char *snd_ctl_card_info_get_id(const snd_ctl_card_info_t *obj)
 {
@@ -1898,9 +2169,12 @@ const char *snd_ctl_card_info_get_id(const snd_ctl_card_info_t *obj)
 }
 
 /**
- * \brief Get card driver name from a CTL card info
- * \param obj CTL card info
- * \return card driver name
+ * \brief Get the sound card driver from the given info object.
+ *
+ * See snd_ctl_card_info_t for more details.
+ *
+ * \param obj The card info object.
+ * \return The sound card driver.
  */
 const char *snd_ctl_card_info_get_driver(const snd_ctl_card_info_t *obj)
 {
@@ -1909,9 +2183,12 @@ const char *snd_ctl_card_info_get_driver(const snd_ctl_card_info_t *obj)
 }
 
 /**
- * \brief Get card name from a CTL card info
- * \param obj CTL card info
- * \return card name
+ * \brief Get the sound card name from the given info object.
+ *
+ * See snd_ctl_card_info_t for more details.
+ *
+ * \param obj The card info object.
+ * \return Sound card name.
  */
 const char *snd_ctl_card_info_get_name(const snd_ctl_card_info_t *obj)
 {
@@ -1920,9 +2197,12 @@ const char *snd_ctl_card_info_get_name(const snd_ctl_card_info_t *obj)
 }
 
 /**
- * \brief Get card long name from a CTL card info
- * \param obj CTL card info
- * \return card long name
+ * \brief Get the sound cards long name from the given info object.
+ *
+ * See snd_ctl_card_info_t for more details.
+ *
+ * \param obj The card info object.
+ * \return Sound cards long name.
  */
 const char *snd_ctl_card_info_get_longname(const snd_ctl_card_info_t *obj)
 {
@@ -1931,9 +2211,12 @@ const char *snd_ctl_card_info_get_longname(const snd_ctl_card_info_t *obj)
 }
 
 /**
- * \brief Get card mixer name from a CTL card info
- * \param obj CTL card info
- * \return card mixer name
+ * \brief Get the sound card mixer name from the given info object.
+ *
+ * See snd_ctl_card_info_t for more details.
+ *
+ * \param obj The card info object.
+ * \return Sound card mixer name.
  */
 const char *snd_ctl_card_info_get_mixername(const snd_ctl_card_info_t *obj)
 {
@@ -1942,9 +2225,12 @@ const char *snd_ctl_card_info_get_mixername(const snd_ctl_card_info_t *obj)
 }
 
 /**
- * \brief Get card component list from a CTL card info
- * \param obj CTL card info
- * \return card mixer identifier
+ * \brief Get the sound cards "components" property from the given info object.
+ *
+ * See snd_ctl_card_info_t for more details.
+ *
+ * \param obj The card info object.
+ * \return Sound cards "components" property.
  */
 const char *snd_ctl_card_info_get_components(const snd_ctl_card_info_t *obj)
 {
@@ -2016,7 +2302,7 @@ snd_ctl_event_type_t snd_ctl_event_get_type(const snd_ctl_event_t *obj)
 }
 
 /**
- * \brief get size of #snd_ctl_elem_list_t
+ * \brief get size of #snd_ctl_elem_list_t.
  * \return size in bytes
  */
 size_t snd_ctl_elem_list_sizeof()
@@ -2025,7 +2311,10 @@ size_t snd_ctl_elem_list_sizeof()
 }
 
 /**
- * \brief allocate an invalid #snd_ctl_elem_list_t using standard malloc
+ * \brief allocate a #snd_ctl_elem_list_t using standard malloc.
+ *
+ * The memory can be released using snd_ctl_elem_list_free().
+ *
  * \param ptr returned pointer
  * \return 0 on success otherwise negative error code
  */
@@ -2039,7 +2328,15 @@ int snd_ctl_elem_list_malloc(snd_ctl_elem_list_t **ptr)
 }
 
 /**
- * \brief frees a previously allocated #snd_ctl_elem_list_t
+ * \brief frees a previously allocated #snd_ctl_elem_list_t.
+ *
+ * Release memory previously allocated using
+ * snd_ctl_elem_list_malloc().
+ *
+ * If you used snd_ctl_elem_list_alloc_space() on the list, you must
+ * use snd_ctl_elem_list_free_space() \em before calling this
+ * function.
+ *
  * \param obj pointer to object to free
  */
 void snd_ctl_elem_list_free(snd_ctl_elem_list_t *obj)
@@ -2048,7 +2345,15 @@ void snd_ctl_elem_list_free(snd_ctl_elem_list_t *obj)
 }
 
 /**
- * \brief clear given #snd_ctl_elem_list_t object
+ * \brief Clear given #snd_ctl_elem_list_t object.
+ *
+ * This will make the stored identifiers inaccessible without freeing
+ * their space.
+ *
+ * \warning The element identifier space cannot be freed after calling
+ *          this function. Therefore, snd_ctl_elem_list_free_space()
+ *          must be called in advance.
+ *
  * \param obj pointer to object to clear
  */
 void snd_ctl_elem_list_clear(snd_ctl_elem_list_t *obj)
@@ -2057,7 +2362,11 @@ void snd_ctl_elem_list_clear(snd_ctl_elem_list_t *obj)
 }
 
 /**
- * \brief copy one #snd_ctl_elem_list_t to another
+ * \brief copy one #snd_ctl_elem_list_t to another.
+ *
+ * This performs a shallow copy. That means the both lists will share
+ * the same space for the elements.  The elements will not be copied.
+ *
  * \param dst pointer to destination
  * \param src pointer to source
  */
@@ -2080,6 +2389,12 @@ void snd_ctl_elem_list_set_offset(snd_ctl_elem_list_t *obj, unsigned int val)
 
 /**
  * \brief Get number of used entries in CTL element identifiers list
+ *
+ * This function returns how many entries are actually filled with
+ * useful information.
+ *
+ * See also snd_ctl_elem_list_get_count().
+ *
  * \param obj CTL element identifier list
  * \return number of used entries
  */
@@ -2090,7 +2405,14 @@ unsigned int snd_ctl_elem_list_get_used(const snd_ctl_elem_list_t *obj)
 }
 
 /**
- * \brief Get total count of elements present in CTL device (information present in every filled CTL element identifiers list)
+ * \brief Get total count of elements present in CTL device
+ *
+ * This function returns how many entries were allocated using
+ * snd_ctl_elem_list_alloc_space(). This information is present after
+ * snd_ctl_elem_list() was called.
+ *
+ * See also snd_ctl_elem_list_get_used().
+ *
  * \param obj CTL element identifier list
  * \return total number of elements
  */
@@ -2140,7 +2462,7 @@ snd_ctl_elem_iface_t snd_ctl_elem_list_get_interface(const snd_ctl_elem_list_t *
 }
 
 /**
- * \brief Get device part of CTL element identifier for an entry of a CTL element identifiers list
+ * \brief Get the device part of CTL element identifier for an entry of a CTL element identifiers list
  * \param obj CTL element identifier list
  * \param idx Index of entry
  * \return CTL element related device
@@ -2754,6 +3076,46 @@ void snd_ctl_elem_info_set_index(snd_ctl_elem_info_t *obj, unsigned int val)
 }
 
 /**
+ * \brief Set readability/writeability parameter of a CTL element id/info
+ * \param obj CTL element id/info
+ * \param rval readability part of element identifier
+ * \param wval writeability part of element identifier
+ */
+void snd_ctl_elem_info_set_read_write(snd_ctl_elem_info_t *obj, int rval, int wval)
+{
+	assert(obj);
+	obj->access = (obj->access & ~SNDRV_CTL_ELEM_ACCESS_READWRITE) |
+				(rval ? SNDRV_CTL_ELEM_ACCESS_READ : 0) |
+				(wval ? SNDRV_CTL_ELEM_ACCESS_WRITE : 0);
+}
+
+/**
+ * \brief Set TLV readability/writeability parameter of a CTL element id/info
+ * \param obj CTL element id/info
+ * \param rval TLV readability part of element identifier
+ * \param wval TLV writeability part of element identifier
+ */
+void snd_ctl_elem_info_set_tlv_read_write(snd_ctl_elem_info_t *obj, int rval, int wval)
+{
+	assert(obj);
+	obj->access = (obj->access & ~SNDRV_CTL_ELEM_ACCESS_TLV_READWRITE) |
+				(rval ? SNDRV_CTL_ELEM_ACCESS_TLV_READ : 0) |
+				(wval ? SNDRV_CTL_ELEM_ACCESS_TLV_WRITE : 0);
+}
+
+/**
+ * \brief Set inactive parameter of a CTL element id/info
+ * \param obj CTL element id/info
+ * \param val inactive part of element identifier
+ */
+void snd_ctl_elem_info_set_inactive(snd_ctl_elem_info_t *obj, int val)
+{
+	assert(obj);
+	obj->access = (obj->access & ~SNDRV_CTL_ELEM_ACCESS_INACTIVE) |
+				(val ? SNDRV_CTL_ELEM_ACCESS_INACTIVE : 0);
+}
+
+/**
  * \brief Get size of data structure for an element.
  * \return Size in bytes.
  */
@@ -2763,9 +3125,16 @@ size_t snd_ctl_elem_value_sizeof()
 }
 
 /**
- * \brief Allocate an invalid #snd_ctl_elem_value_t using standard malloc(3).
- * \param ptr Returned pointer for data of an element.
- * \return 0 on success otherwise negative error code.
+ * \brief Allocate an invalid #snd_ctl_elem_value_t on the heap.
+ *
+ * Allocate space for a value object on the heap. The allocated memory
+ * must be freed using snd_ctl_elem_value_free().
+ *
+ * See snd_ctl_elem_value_t for details.
+ *
+ * \param ptr Pointer to a snd_ctl_elem_value_t pointer. The address
+ *            of the allocated space will be returned here.
+ * \return 0 on success, otherwise a negative error code.
  */
 int snd_ctl_elem_value_malloc(snd_ctl_elem_value_t **ptr)
 {
@@ -2777,8 +3146,10 @@ int snd_ctl_elem_value_malloc(snd_ctl_elem_value_t **ptr)
 }
 
 /**
- * \brief Frees a previously allocated data of an element.
- * \param obj Data of an element.
+ * \brief Free an #snd_ctl_elem_value_t previously allocated using
+ *        snd_ctl_elem_value_malloc().
+ *
+ * \param obj Pointer to the snd_ctl_elem_value_t.
  */
 void snd_ctl_elem_value_free(snd_ctl_elem_value_t *obj)
 {
@@ -2787,6 +3158,9 @@ void snd_ctl_elem_value_free(snd_ctl_elem_value_t *obj)
 
 /**
  * \brief Clear given data of an element.
+ *
+ * See snd_ctl_elem_value_t for details.
+ *
  * \param obj Data of an element.
  */
 void snd_ctl_elem_value_clear(snd_ctl_elem_value_t *obj)
@@ -2795,7 +3169,7 @@ void snd_ctl_elem_value_clear(snd_ctl_elem_value_t *obj)
 }
 
 /**
- * \brief Copy two data of elements.
+ * \brief Bitwise copy of a snd_ctl_elem_value_t value.
  * \param dst Pointer to destination.
  * \param src Pointer to source.
  */
@@ -2807,9 +3181,10 @@ void snd_ctl_elem_value_copy(snd_ctl_elem_value_t *dst,
 }
 
 /**
- * \brief Compare one data of an element to the other.
- * \param left Pointer to first data.
- * \param right Pointer to second data.
+ * \brief Compare two snd_ctl_elem_value_t values, bytewise.
+ *
+ * \param left First value.
+ * \param right Second value.
  * \return 0 on match, less than or greater than otherwise, see memcmp(3).
  */
 int snd_ctl_elem_value_compare(snd_ctl_elem_value_t *left,
@@ -2820,9 +3195,13 @@ int snd_ctl_elem_value_compare(snd_ctl_elem_value_t *left,
 }
 
 /**
- * \brief Get element identifier from given data of an element.
- * \param obj Data of an element.
- * \param ptr Pointer for element identifier.
+ * \brief Get the element identifier from the given element value.
+ *
+ * See snd_ctl_elem_value_t for more details.
+ *
+ * \param obj The element value.
+ * \param ptr Pointer to an identifier object. The identifier is
+ *            stored there.
  */
 void snd_ctl_elem_value_get_id(const snd_ctl_elem_value_t *obj, snd_ctl_elem_id_t *ptr)
 {
@@ -2831,9 +3210,12 @@ void snd_ctl_elem_value_get_id(const snd_ctl_elem_value_t *obj, snd_ctl_elem_id_
 }
 
 /**
- * \brief Get element numeric identifier from given data of an element.
- * \param obj Data of an element.
- * \return Element numeric identifier.
+ * \brief Get the identifiers 'numid' part from the given element value.
+ *
+ * See snd_ctl_elem_value_t for more details.
+ *
+ * \param obj The element value.
+ * \return The numid.
  */
 unsigned int snd_ctl_elem_value_get_numid(const snd_ctl_elem_value_t *obj)
 {
@@ -2842,10 +3224,12 @@ unsigned int snd_ctl_elem_value_get_numid(const snd_ctl_elem_value_t *obj)
 }
 
 /**
- * \brief Get interface part of element identifier from given data of an
- *	  element.
- * \param obj Data of an element.
- * \return Interface part of element identifier.
+ * \brief Get the identifiers 'interface' part from the given element value.
+ *
+ * See snd_ctl_elem_value_t for more details.
+ *
+ * \param obj The element value.
+ * \return The interface part of element identifier.
  */
 snd_ctl_elem_iface_t snd_ctl_elem_value_get_interface(const snd_ctl_elem_value_t *obj)
 {
@@ -2854,9 +3238,12 @@ snd_ctl_elem_iface_t snd_ctl_elem_value_get_interface(const snd_ctl_elem_value_t
 }
 
 /**
- * \brief Get device part of element identifier from given data of an element.
- * \param obj Data of an element.
- * \return Device part of element identifier.
+ * \brief Get the identifiers 'device' part from the given element value.
+ *
+ * See snd_ctl_elem_value_t for more details.
+ *
+ * \param obj The element value.
+ * \return The device part of element identifier.
  */
 unsigned int snd_ctl_elem_value_get_device(const snd_ctl_elem_value_t *obj)
 {
@@ -2865,10 +3252,12 @@ unsigned int snd_ctl_elem_value_get_device(const snd_ctl_elem_value_t *obj)
 }
 
 /**
- * \brief Get subdevice part of element identifier from given data of an
- *	  element.
- * \param obj Data of an element.
- * \return Subdevice part of element identifier.
+ * \brief Get the identifiers 'subdevice' part from the given element value.
+ *
+ * See snd_ctl_elem_value_t for more details.
+ *
+ * \param obj The element value.
+ * \return The subdevice part of element identifier.
  */
 unsigned int snd_ctl_elem_value_get_subdevice(const snd_ctl_elem_value_t *obj)
 {
@@ -2877,9 +3266,12 @@ unsigned int snd_ctl_elem_value_get_subdevice(const snd_ctl_elem_value_t *obj)
 }
 
 /**
- * \brief Get name part of element identifier from given data of an element.
- * \param obj Data of an element.
- * \return Name part of element identifier.
+ * \brief Get the identifiers 'name' part from the given element value.
+ *
+ * See snd_ctl_elem_value_t for more details.
+ *
+ * \param obj The element value.
+ * \return The "name" part of element identifier.
  */
 const char *snd_ctl_elem_value_get_name(const snd_ctl_elem_value_t *obj)
 {
@@ -2888,9 +3280,12 @@ const char *snd_ctl_elem_value_get_name(const snd_ctl_elem_value_t *obj)
 }
 
 /**
- * \brief Get index part of element identifier from given data of an element.
- * \param obj Data of an element.
- * \return Index part of element identifier.
+ * \brief Get the identifiers 'index' part from the given element value.
+ *
+ * See snd_ctl_elem_value_t for more details.
+ *
+ * \param obj The element value.
+ * \return The index part of element identifier.
  */
 unsigned int snd_ctl_elem_value_get_index(const snd_ctl_elem_value_t *obj)
 {
@@ -2898,10 +3293,14 @@ unsigned int snd_ctl_elem_value_get_index(const snd_ctl_elem_value_t *obj)
 	return obj->id.index;
 }
 
+
 /**
- * \brief Set element identifier to given data of an element.
- * \param obj Data of an element.
- * \param ptr Pointer to an element identifier.
+ * \brief Set the element identifier within the given element value.
+ *
+ * See snd_ctl_elem_value_t for more details.
+ *
+ * \param obj The element value.
+ * \param ptr The new identifier.
  */
 void snd_ctl_elem_value_set_id(snd_ctl_elem_value_t *obj, const snd_ctl_elem_id_t *ptr)
 {
@@ -2910,9 +3309,12 @@ void snd_ctl_elem_value_set_id(snd_ctl_elem_value_t *obj, const snd_ctl_elem_id_
 }
 
 /**
- * \brief Set numeric identifier to given data of an element.
- * \param obj Data of an element.
- * \param val Value for numeric identifier.
+ * \brief Set the identifiers 'numid' part within the given element value.
+ *
+ * See snd_ctl_elem_value_t for more details.
+ *
+ * \param obj The element value.
+ * \param val The new numid.
  */
 void snd_ctl_elem_value_set_numid(snd_ctl_elem_value_t *obj, unsigned int val)
 {
@@ -2921,9 +3323,12 @@ void snd_ctl_elem_value_set_numid(snd_ctl_elem_value_t *obj, unsigned int val)
 }
 
 /**
- * \brief Set interface part of element identifier to given data of an element.
- * \param obj Data of an element.
- * \param val Value for interface part of element identifier.
+ * \brief Set the identifiers 'interface' part within the given element value.
+ *
+ * See snd_ctl_elem_value_t for more details.
+ *
+ * \param obj The element value.
+ * \param val The new interface.
  */
 void snd_ctl_elem_value_set_interface(snd_ctl_elem_value_t *obj, snd_ctl_elem_iface_t val)
 {
@@ -2932,9 +3337,12 @@ void snd_ctl_elem_value_set_interface(snd_ctl_elem_value_t *obj, snd_ctl_elem_if
 }
 
 /**
- * \brief Set device part of element identifier to given data of an element.
- * \param obj Data of an element.
- * \param val Value for device part of element identifier.
+ * \brief Set the identifiers 'device' part within the given element value.
+ *
+ * See snd_ctl_elem_value_t for more details.
+ *
+ * \param obj The element value.
+ * \param val The new device.
  */
 void snd_ctl_elem_value_set_device(snd_ctl_elem_value_t *obj, unsigned int val)
 {
@@ -2943,9 +3351,12 @@ void snd_ctl_elem_value_set_device(snd_ctl_elem_value_t *obj, unsigned int val)
 }
 
 /**
- * \brief Set subdevice part of element identifier to given data of an element.
- * \param obj Data of an element.
- * \param val Value for subdevice part of element identifier.
+ * \brief Set the identifiers 'subdevice' part within the given element value.
+ *
+ * See snd_ctl_elem_value_t for more details.
+ *
+ * \param obj The element value.
+ * \param val The new subdevice.
  */
 void snd_ctl_elem_value_set_subdevice(snd_ctl_elem_value_t *obj, unsigned int val)
 {
@@ -2954,9 +3365,12 @@ void snd_ctl_elem_value_set_subdevice(snd_ctl_elem_value_t *obj, unsigned int va
 }
 
 /**
- * \brief Set name part of element identifier to given data of an element.
- * \param obj Data of an element.
- * \param val Value for name part of element identifier,
+ * \brief Set the identifiers 'name' part within the given element value.
+ *
+ * See snd_ctl_elem_value_t for more details.
+ *
+ * \param obj The element value.
+ * \param val The new name.
  */
 void snd_ctl_elem_value_set_name(snd_ctl_elem_value_t *obj, const char *val)
 {
@@ -2965,9 +3379,12 @@ void snd_ctl_elem_value_set_name(snd_ctl_elem_value_t *obj, const char *val)
 }
 
 /**
- * \brief Set index part of element identifier to given data of an element.
- * \param obj Data of an element.
- * \param val Value for index part of element identifier.
+ * \brief Set the identifiers 'index' part within the given element value.
+ *
+ * See snd_ctl_elem_value_t for more details.
+ *
+ * \param obj The element value.
+ * \param val The new index.
  */
 void snd_ctl_elem_value_set_index(snd_ctl_elem_value_t *obj, unsigned int val)
 {
@@ -2976,12 +3393,16 @@ void snd_ctl_elem_value_set_index(snd_ctl_elem_value_t *obj, unsigned int val)
 }
 
 /**
- * \brief Get value of a specified member from given data as an element of
- *	  boolean type.
- * \param obj Data of an element.
- * \param idx Index of member in the element.
- * \return Value for the member.
- */ 
+ * \brief Get an element members value.
+ *
+ * Use this function if the element is of type SNDRV_CTL_ELEM_TYPE_BOOLEAN. It
+ * returns the value of one member. See \ref snd_ctl_elem_value_t and \ref
+ * control for more details.
+ *
+ * \param obj The element value object
+ * \param idx The index of the member.
+ * \return The members value.
+ */
 int snd_ctl_elem_value_get_boolean(const snd_ctl_elem_value_t *obj, unsigned int idx)
 {
 	assert(obj);
@@ -2990,12 +3411,16 @@ int snd_ctl_elem_value_get_boolean(const snd_ctl_elem_value_t *obj, unsigned int
 }
 
 /**
- * \brief Get value of a specified member from given data as an element of
- *	  integer type.
- * \param obj Data of an element.
- * \param idx Index of member in the element.
- * \return Value for the member.
- */ 
+ * \brief Get an element members value.
+ *
+ * Use this function if the element is of type SNDRV_CTL_ELEM_TYPE_INTEGER. It
+ * returns the value of one member. See \ref snd_ctl_elem_value_t and \ref
+ * control for more details.
+ *
+ * \param obj The element value object.
+ * \param idx The index of the member.
+ * \return The members value.
+ */
 long snd_ctl_elem_value_get_integer(const snd_ctl_elem_value_t *obj, unsigned int idx)
 {
 	assert(obj);
@@ -3004,12 +3429,16 @@ long snd_ctl_elem_value_get_integer(const snd_ctl_elem_value_t *obj, unsigned in
 }
 
 /**
- * \brief Get value of a specified member from given data as an element of
- *	  integer64 type.
- * \param obj Data of an element.
- * \param idx Index of member in the element.
- * \return Value for the member.
- */ 
+ * \brief Get an element members value.
+ *
+ * Use this function if the element is of type SNDRV_CTL_ELEM_TYPE_INTEGER64. It
+ * returns the value of one member. See \ref snd_ctl_elem_value_t and \ref
+ * control for more details.
+ *
+ * \param obj The element value object.
+ * \param idx The index of the member.
+ * \return The members value.
+ */
 long long snd_ctl_elem_value_get_integer64(const snd_ctl_elem_value_t *obj, unsigned int idx)
 {
 	assert(obj);
@@ -3018,12 +3447,16 @@ long long snd_ctl_elem_value_get_integer64(const snd_ctl_elem_value_t *obj, unsi
 }
 
 /**
- * \brief Get value of a specified member from given data as an element of
- *	  enumerated type.
- * \param obj Data of an element.
- * \param idx Index of member in the element.
- * \return Value for the member. This is an index of name set in the element.
- */ 
+ * \brief Get an element members value.
+ *
+ * Use this function if the element is of type
+ * SNDRV_CTL_ELEM_TYPE_ENUMERATED. It returns the index of the active item. See
+ * \ref snd_ctl_elem_value_t and \ref control for more details.
+ *
+ * \param obj The element value object.
+ * \param idx The index of the requested member.
+ * \return The index of the active item.
+ */
 unsigned int snd_ctl_elem_value_get_enumerated(const snd_ctl_elem_value_t *obj, unsigned int idx)
 {
 	assert(obj);
@@ -3032,12 +3465,16 @@ unsigned int snd_ctl_elem_value_get_enumerated(const snd_ctl_elem_value_t *obj, 
 }
 
 /**
- * \brief Get value of a specified member from given data as an element of
- *	  bytes type.
- * \param obj Data of an element.
- * \param idx Index of member in the element.
- * \return Value for the member.
- */ 
+ * \brief Get an element members value.
+ *
+ * Use this function if the element is of type SNDRV_CTL_ELEM_TYPE_BYTE. It
+ * returns the value of one member. See \ref snd_ctl_elem_value_t and \ref
+ * control for more details.
+ *
+ * \param obj The element value object.
+ * \param idx The index of the member.
+ * \return The members value.
+ */
 unsigned char snd_ctl_elem_value_get_byte(const snd_ctl_elem_value_t *obj, unsigned int idx)
 {
 	assert(obj);
@@ -3046,12 +3483,16 @@ unsigned char snd_ctl_elem_value_get_byte(const snd_ctl_elem_value_t *obj, unsig
 }
 
 /**
- * \brief Set value of a specified member to given data as an element of
- *	  boolean type.
- * \param obj Data of an element.
- * \param idx Index of member in the element.
- * \param val Value for the member.
- */ 
+ * \brief Set an element members value.
+ *
+ * Use this function if the element is of type SNDRV_CTL_ELEM_TYPE_BOOLEAN. It
+ * sets the value of one member. See \ref snd_ctl_elem_value_t and \ref control
+ * for more details.
+ *
+ * \param obj The element value object.
+ * \param idx The index of the member.
+ * \param val The new value.
+ */
 void snd_ctl_elem_value_set_boolean(snd_ctl_elem_value_t *obj, unsigned int idx, long val)
 {
 	assert(obj);
@@ -3060,12 +3501,16 @@ void snd_ctl_elem_value_set_boolean(snd_ctl_elem_value_t *obj, unsigned int idx,
 }
 
 /**
- * \brief Set value of a specified member to given data as an element of
- *	  integer type.
- * \param obj Data of an element.
- * \param idx Index of member in the element.
- * \param val Value for the member.
- */ 
+ * \brief Set an element members value.
+ *
+ * Use this function if the element is of type SNDRV_CTL_ELEM_TYPE_INTEGER. It
+ * sets the value of one member. See \ref snd_ctl_elem_value_t and \ref control
+ * for more details.
+ *
+ * \param obj The element value object.
+ * \param idx The index of the member.
+ * \param val The new value.
+ */
 void snd_ctl_elem_value_set_integer(snd_ctl_elem_value_t *obj, unsigned int idx, long val)
 {
 	assert(obj);
@@ -3074,12 +3519,16 @@ void snd_ctl_elem_value_set_integer(snd_ctl_elem_value_t *obj, unsigned int idx,
 }
 
 /**
- * \brief Set value of a specified member to given data as an element of
- *	  integer64 type.
- * \param obj Data of an element.
- * \param idx Index of member in the element.
- * \param val Value for the member.
- */ 
+ * \brief Set an element members value.
+ *
+ * Use this function if the element is of type SNDRV_CTL_ELEM_TYPE_INTEGER64. It
+ * sets the value of one member. See \ref snd_ctl_elem_value_t and \ref control
+ * for more details.
+ *
+ * \param obj The element value object.
+ * \param idx The index of the member.
+ * \param val The new value.
+ */
 void snd_ctl_elem_value_set_integer64(snd_ctl_elem_value_t *obj, unsigned int idx, long long val)
 {
 	assert(obj);
@@ -3088,12 +3537,16 @@ void snd_ctl_elem_value_set_integer64(snd_ctl_elem_value_t *obj, unsigned int id
 }
 
 /**
- * \brief Set value of a specified member to given data as an element of
- * 	  enumerated type.
- * \param obj Data of an element.
- * \param idx Index of member in the element.
- * \param val Value for the member.
- */ 
+ * \brief Set an element members value.
+ *
+ * Use this function if the element is of type
+ * SNDRV_CTL_ELEM_TYPE_ENUMERATED. It activates the specified item. See \ref
+ * snd_ctl_elem_value_t and \ref control for more details.
+ *
+ * \param obj The element value object.
+ * \param idx The index of the requested member.
+ * \param val The new index of the item to be activated.
+ */
 void snd_ctl_elem_value_set_enumerated(snd_ctl_elem_value_t *obj, unsigned int idx, unsigned int val)
 {
 	assert(obj);
@@ -3102,12 +3555,16 @@ void snd_ctl_elem_value_set_enumerated(snd_ctl_elem_value_t *obj, unsigned int i
 }
 
 /**
- * \brief Set value for a specified member to given data as an element of byte
- *	  type.
- * \param obj Data of an element.
- * \param idx Index of member in the element.
- * \param val Value for the member.
- */ 
+ * \brief Set an element members value.
+ *
+ * Use this function if the element is of type SNDRV_CTL_ELEM_TYPE_BYTE. It
+ * sets the value of one member. See \ref snd_ctl_elem_value_t and \ref control
+ * for more details.
+ *
+ * \param obj The element value object.
+ * \param idx The index of the member.
+ * \param val The new value.
+ */
 void snd_ctl_elem_value_set_byte(snd_ctl_elem_value_t *obj, unsigned int idx, unsigned char val)
 {
 	assert(obj);
@@ -3116,10 +3573,17 @@ void snd_ctl_elem_value_set_byte(snd_ctl_elem_value_t *obj, unsigned int idx, un
 }
 
 /**
- * \brief Set values to given data as an element of bytes type.
- * \param obj Data of an element.
- * \param data Pointer for byte array.
- * \param size The number of bytes included in the memory block.
+ * \brief Replace the data stored within the element.
+ *
+ * Use this function if the element is of type SNDRV_CTL_ELEM_TYPE_BYTES. It
+ * replaces the data stored in the element. Note that "bytes" elements don't
+ * have members. They have only one single block of data.
+ *
+ * See \ref snd_ctl_elem_value_t and \ref control for more details.
+ *
+ * \param obj The element value object.
+ * \param data Pointer to the new data.
+ * \param size The size of the new data, in bytes.
  */
 void snd_ctl_elem_set_bytes(snd_ctl_elem_value_t *obj, void *data, size_t size)
 {
@@ -3129,10 +3593,17 @@ void snd_ctl_elem_set_bytes(snd_ctl_elem_value_t *obj, void *data, size_t size)
 }
 
 /**
- * \brief Get memory block from given data as an element of bytes type.
- * \param obj Data of an element.
- * \return Pointer for byte array.
- */ 
+ * \brief Get the data stored within the element.
+ *
+ * Use this function if the element is of type SNDRV_CTL_ELEM_TYPE_BYTES. It
+ * returns the data stored in the element. Note that "bytes" elements don't have
+ * members. They have only one single block of data.
+ *
+ * See \ref snd_ctl_elem_value_t and \ref control for more details.
+ *
+ * \param obj The element value object.
+ * \return Pointer to the elements data.
+ */
 const void * snd_ctl_elem_value_get_bytes(const snd_ctl_elem_value_t *obj)
 {
 	assert(obj);
@@ -3140,11 +3611,17 @@ const void * snd_ctl_elem_value_get_bytes(const snd_ctl_elem_value_t *obj)
 }
 
 /**
- * \brief Get value from given data to given pointer as an element of IEC958
- *	  type.
- * \param obj Data of an element.
- * \param ptr Pointer to IEC958 data.
- */ 
+ * \brief Get an elements IEC958 data.
+ *
+ * Use this function if the element is of type SNDRV_CTL_ELEM_TYPE_IEC958.  Note that
+ * "IEC958" elements don't have members. They have only one single
+ * IEC958 information block.
+ *
+ * See \ref snd_ctl_elem_value_t and \ref control for more details.
+ *
+ * \param obj The element value object.
+ * \param ptr Pointer to an IEC958 structure. The data is stored there.
+ */
 void snd_ctl_elem_value_get_iec958(const snd_ctl_elem_value_t *obj, snd_aes_iec958_t *ptr)
 {
 	assert(obj && ptr);
@@ -3152,14 +3629,19 @@ void snd_ctl_elem_value_get_iec958(const snd_ctl_elem_value_t *obj, snd_aes_iec9
 }
 
 /**
- * \brief Set value from given pointer to given data as an element of IEC958
- *	  type.
- * \param obj Data of an element.
- * \param ptr Pointer to IEC958 data.
- */ 
+ * \brief Set an elements IEC958 data.
+ *
+ * Use this function if the element is of type SNDRV_CTL_ELEM_TYPE_IEC958.  Note
+ * that "IEC958" elements don't have members. They have only one single IEC958
+ * information block.
+ *
+ * See \ref snd_ctl_elem_value_t and \ref control for more details.
+ *
+ * \param obj The element value object.
+ * \param ptr Pointer to the new IEC958 data.
+ */
 void snd_ctl_elem_value_set_iec958(snd_ctl_elem_value_t *obj, const snd_aes_iec958_t *ptr)
 {
 	assert(obj && ptr);
 	memcpy(&obj->value.iec958, ptr, sizeof(obj->value.iec958));
 }
-

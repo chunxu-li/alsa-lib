@@ -186,6 +186,7 @@ struct snd_pcm_direct {
 			mix_areas_32_t *remix_areas_32;
 			mix_areas_24_t *remix_areas_24;
 			mix_areas_u8_t *remix_areas_u8;
+			unsigned int use_sem;
 		} dmix;
 		struct {
 			unsigned long long chn_mask;
@@ -364,3 +365,7 @@ struct snd_pcm_direct_open_conf {
 };
 
 int snd_pcm_direct_parse_open_conf(snd_config_t *root, snd_config_t *conf, int stream, struct snd_pcm_direct_open_conf *rec);
+
+int _snd_pcm_direct_new(snd_pcm_t **pcmp, snd_pcm_direct_t **_dmix, int type,
+			const char *name, struct snd_pcm_direct_open_conf *opts,
+			struct slave_params *params, snd_pcm_stream_t stream, int mode);

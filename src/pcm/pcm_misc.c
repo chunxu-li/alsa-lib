@@ -763,6 +763,7 @@ snd_pcm_format_t snd_pcm_build_linear_format(int width, int pwidth, int unsignd,
  * \param hwctlp the pointer to store the h/w control flag (optional)
  * \return 0 if successful, or a negative error code
  *
+ * \deprecated	Since 1.2.5
  * This function parses the given config tree to retrieve the control element id
  * and the card index.  It's used by softvol.  External PCM plugins can use this
  * function for creating or assigining their controls.
@@ -793,21 +794,10 @@ int snd_pcm_parse_control_id(snd_config_t *conf, snd_ctl_elem_id_t *ctl_id, int 
 		if (strcmp(id, "comment") == 0)
 			continue;
 		if (strcmp(id, "card") == 0) {
-			const char *str;
-			long v;
-			if ((err = snd_config_get_integer(n, &v)) < 0) {
-				if ((err = snd_config_get_string(n, &str)) < 0) {
-					SNDERR("Invalid field %s", id);
-					goto _err;
-				}
-				*cardp = snd_card_get_index(str);
-				if (*cardp < 0) {
-					SNDERR("Cannot get index for %s", str);
-					err = *cardp;
-					goto _err;
-				}
-			} else
-				*cardp = v;
+			err = snd_config_get_card(n);
+			if (err < 0)
+				goto _err;
+			*cardp = err;
 			continue;
 		}
 		if (strcmp(id, "iface") == 0 || strcmp(id, "interface") == 0) {

@@ -1,6 +1,6 @@
 dnl Process this file with autoconf to produce a configure script.
 AC_PREREQ(2.59)
-AC_INIT(alsa-lib, 1.2.2)
+AC_INIT(alsa-lib, 1.2.6)
 
 AC_CONFIG_SRCDIR([src/control/control.c])
 AC_CONFIG_MACRO_DIR([m4])
@@ -50,6 +50,7 @@ AC_HEADER_TIME
 dnl Checks for library functions.
 AC_PROG_GCC_TRADITIONAL
 AC_CHECK_FUNCS([uselocale])
+AC_CHECK_FUNCS([eaccess])
 
 SAVE_LIBRARY_VERSION
 AC_SUBST(LIBTOOL_VERSION_INFO)
@@ -516,6 +517,13 @@ if test -z "$gcc_have_atomics"; then
 fi
 AC_MSG_RESULT($gcc_have_atomics)
 
+dnl check mmx register for pcm_dmix_i386
+
+AC_TRY_LINK([],
+    [__asm__ volatile ("" : : : "mm0");],
+    [AC_DEFINE([HAVE_MMX], "1", [MMX technology is enabled])],
+    [])
+
 PCM_PLUGIN_LIST="copy linear route mulaw alaw adpcm rate plug multi shm file null empty share meter hooks lfloat ladspa dmix dshare dsnoop asym iec958 softvol extplug ioplug mmap_emul"
 
 build_pcm_plugin="no"
@@ -622,6 +630,19 @@ if test "$build_pcm_mmap_emul" = "yes"; then
   AC_DEFINE([BUILD_PCM_PLUGIN_MMAP_EMUL], "1", [Build PCM mmap-emul plugin])
 fi
 
+if test "$build_pcm_dmix" = "yes"; then
+AC_MSG_CHECKING(for default lockless dmix)
+AC_ARG_ENABLE(lockless-dmix,
+  AS_HELP_STRING([--enable-lockless-dmix],
+    [use lockless dmix as default on x86]),
+  lockless_dmix="$enableval", lockless_dmix="no")
+if test "$lockless_dmix" = "yes"; then
+  AC_MSG_RESULT(yes)
+  AC_DEFINE([LOCKLESS_DMIX_DEFAULT], "1", [Lockless dmix as default])
+else
+  AC_MSG_RESULT(no)
+fi
+fi
 
 dnl Create PCM plugin symbol list for static library
 rm -f "$srcdir"/src/pcm/pcm_symbols_list.c
@@ -639,7 +660,7 @@ AC_ARG_WITH(ctl-plugins,
     [build control plugins (default = all)]),
   [ctl_plugins="$withval"], [ctl_plugins="all"])
 
-CTL_PLUGIN_LIST="shm ext"
+CTL_PLUGIN_LIST="remap shm ext"
 
 build_ctl_plugin="no"
 for t in $CTL_PLUGIN_LIST; do
@@ -661,6 +682,7 @@ if test "$ac_cv_header_sys_shm_h" != "yes"; then
 fi
 
 AM_CONDITIONAL([BUILD_CTL_PLUGIN], [test x$build_ctl_plugin = xyes])
+AM_CONDITIONAL([BUILD_CTL_PLUGIN_REMAP], [test x$build_ctl_remap = xyes])
 AM_CONDITIONAL([BUILD_CTL_PLUGIN_SHM], [test x$build_ctl_shm = xyes])
 AM_CONDITIONAL([BUILD_CTL_PLUGIN_EXT], [test x$build_ctl_ext = xyes])
 
@@ -719,6 +741,7 @@ AC_OUTPUT(Makefile doc/Makefile doc/pictures/Makefile doc/doxygen.cfg \
           src/alisp/Makefile src/topology/Makefile \
 	  src/conf/Makefile \
 	  src/conf/cards/Makefile \
+	  src/conf/ctl/Makefile \
 	  src/conf/pcm/Makefile \
 	  modules/Makefile modules/mixer/Makefile modules/mixer/simple/Makefile \
 	  alsalisp/Makefile aserver/Makefile \

@@ -34,15 +34,22 @@ static const struct map_elem control_map[] = {
 
 static int lookup_ops(const char *c)
 {
-	unsigned int i;
+	int i;
+	long ret;
 
-	for (i = 0; i < ARRAY_SIZE(control_map); i++) {
+	for (i = 0; i < (int)ARRAY_SIZE(control_map); i++) {
 		if (strcmp(control_map[i].name, c) == 0)
 			return control_map[i].id;
 	}
 
 	/* cant find string name in our table so we use its ID number */
-	return strtol(c, NULL, 0);
+	i = safe_strtol(c, &ret);
+	if (i < 0) {
+		SNDERR("wrong kcontrol ops value string '%s'", c);
+		return i;
+	}
+
+	return ret;
 }
 
 const char *tplg_ops_name(int type)
@@ -105,8 +112,8 @@ int tplg_parse_ops(snd_tplg_t *tplg ATTRIBUTE_UNUSED, snd_config_t *cfg,
 
 /* save control operations */
 int tplg_save_ops(snd_tplg_t *tplg ATTRIBUTE_UNUSED,
-		  struct snd_soc_tplg_ctl_hdr *hdr, char **dst,
-		  const char *pfx)
+		  struct snd_soc_tplg_ctl_hdr *hdr,
+		  struct tplg_buf *dst, const char *pfx)
 {
 	const char *s;
 	int err;
@@ -191,7 +198,7 @@ int tplg_parse_ext_ops(snd_tplg_t *tplg ATTRIBUTE_UNUSED,
 /* save external control operations */
 int tplg_save_ext_ops(snd_tplg_t *tplg ATTRIBUTE_UNUSED,
 		      struct snd_soc_tplg_bytes_control *be,
-		      char **dst, const char *pfx)
+		      struct tplg_buf *dst, const char *pfx)
 {
 	const char *s;
 	int err;

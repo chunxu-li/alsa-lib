@@ -416,7 +416,8 @@ int tplg_parse_dapm_graph(snd_tplg_t *tplg, snd_config_t *cfg,
 }
 
 /* save DAPM graph */
-int tplg_save_dapm_graph(snd_tplg_t *tplg, int index, char **dst, const char *pfx)
+int tplg_save_dapm_graph(snd_tplg_t *tplg, int index,
+			 struct tplg_buf *dst, const char *pfx)
 {
 	struct snd_soc_tplg_dapm_graph_elem *route;
 	struct list_head *pos;
@@ -482,7 +483,7 @@ int tplg_save_dapm_graph(snd_tplg_t *tplg, int index, char **dst, const char *pf
 		}
 		if (first) {
 			first = 0;
-			err = tplg_save_printf(dst, pfx, "\t\tlines [\n", elem->index);
+			err = tplg_save_printf(dst, pfx, "\t\tlines [\n");
 			if (err < 0)
 				return err;
 		}
@@ -595,7 +596,8 @@ int tplg_parse_dapm_widget(snd_tplg_t *tplg,
 		}
 
 		if (strcmp(id, "invert") == 0) {
-			if (tplg_get_integer(n, &ival, 0))
+			ival = snd_config_get_bool(n);
+			if (ival < 0)
 				return -EINVAL;
 
 			widget->invert = ival;
@@ -668,7 +670,7 @@ int tplg_parse_dapm_widget(snd_tplg_t *tplg,
 /* save DAPM widget */
 int tplg_save_dapm_widget(snd_tplg_t *tplg ATTRIBUTE_UNUSED,
 			  struct tplg_elem *elem,
-			  char **dst, const char *pfx)
+			  struct tplg_buf *dst, const char *pfx)
 {
 	struct snd_soc_tplg_dapm_widget *widget = elem->widget;
 	const char *s;
@@ -834,6 +836,7 @@ int tplg_add_widget_object(snd_tplg_t *tplg, snd_tplg_obj_template_t *t)
 		default:
 			SNDERR("widget %s: invalid type %d for ctl %d",
 				wt->name, ct->type, i);
+			ret = -EINVAL;
 			break;
 		}
 
@@ -971,8 +974,7 @@ next:
 				err = -EINVAL;
 				goto retval;
 			}
-			err = tplg_decode_control_enum1(tplg, &heap, et, pos,
-							bin, size2);
+			err = tplg_decode_control_enum1(tplg, &heap, et, pos, ec);
 			break;
 		case SND_SOC_TPLG_TYPE_BYTES:
 			bt = tplg_calloc(&heap, sizeof(*bt));

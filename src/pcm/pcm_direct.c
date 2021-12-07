@@ -82,7 +82,13 @@ int snd_pcm_direct_semaphore_create_or_connect(snd_pcm_direct_t *dmix)
 	return 0;
 }
 
-#define SND_PCM_DIRECT_MAGIC	(0xa15ad300 + sizeof(snd_pcm_direct_share_t))
+static unsigned int snd_pcm_direct_magic(snd_pcm_direct_t *dmix)
+{
+	if (!dmix->direct_memory_access)
+		return 0xa15ad300 + sizeof(snd_pcm_direct_share_t);
+	else
+		return 0xb15ad300 + sizeof(snd_pcm_direct_share_t);
+}
 
 /*
  *  global shared memory area 
@@ -132,10 +138,10 @@ retryget:
 			buf.shm_perm.gid = dmix->ipc_gid;
 			shmctl(dmix->shmid, IPC_SET, &buf);
 		}
-		dmix->shmptr->magic = SND_PCM_DIRECT_MAGIC;
+		dmix->shmptr->magic = snd_pcm_direct_magic(dmix);
 		return 1;
 	} else {
-		if (dmix->shmptr->magic != SND_PCM_DIRECT_MAGIC) {
+		if (dmix->shmptr->magic != snd_pcm_direct_magic(dmix)) {
 			snd_pcm_direct_shm_discard(dmix);
 			return -EINVAL;
 		}
@@ -929,10 +935,14 @@ int snd_pcm_direct_hw_refine(snd_pcm_t *pcm, snd_pcm_hw_params_t *params)
 			return err;
 		if (dshare->var_periodsize) {
 			/* more tolerant settings... */
-			if (dshare->shmptr->hw.buffer_size.max / 2 > period_size.max)
+			if (dshare->shmptr->hw.buffer_size.max / 2 > period_size.max) {
 				period_size.max = dshare->shmptr->hw.buffer_size.max / 2;
-			if (dshare->shmptr->hw.buffer_time.max / 2 > period_time.max)
+				period_size.openmax = dshare->shmptr->hw.buffer_size.openmax;
+			}
+			if (dshare->shmptr->hw.buffer_time.max / 2 > period_time.max) {
 				period_time.max = dshare->shmptr->hw.buffer_time.max / 2;
+				period_time.openmax = dshare->shmptr->hw.buffer_time.openmax;
+			}
 		}
 
 		err = hw_param_interval_refine_one(params, SND_PCM_HW_PARAM_PERIOD_SIZE,
@@ -1617,43 +1627,37 @@ int snd_pcm_direct_set_timer_params(snd_pcm_direct_t *dmix)
 int snd_pcm_direct_check_interleave(snd_pcm_direct_t *dmix, snd_pcm_t *pcm)
 {
 	unsigned int chn, channels;
-	int bits, interleaved = 1;
+	int bits;
 	const snd_pcm_channel_area_t *dst_areas;
 	const snd_pcm_channel_area_t *src_areas;
 
 	bits = snd_pcm_format_physical_width(pcm->format);
 	if ((bits % 8) != 0)
-		interleaved = 0;
+		goto __nointerleaved;
 	channels = dmix->channels;
+	if (channels != dmix->spcm->channels)
+		goto __nointerleaved;
 	dst_areas = snd_pcm_mmap_areas(dmix->spcm);
 	src_areas = snd_pcm_mmap_areas(pcm);
 	for (chn = 1; chn < channels; chn++) {
-		if (dst_areas[chn-1].addr != dst_areas[chn].addr) {
-			interleaved = 0;
-			break;
-		}
-		if (src_areas[chn-1].addr != src_areas[chn].addr) {
-			interleaved = 0;
-			break;
-		}
+		if (dst_areas[chn-1].addr != dst_areas[chn].addr)
+			goto __nointerleaved;
+		if (src_areas[chn-1].addr != src_areas[chn].addr)
+			goto __nointerleaved;
 	}
 	for (chn = 0; chn < channels; chn++) {
-		if (dmix->bindings && dmix->bindings[chn] != chn) {
-			interleaved = 0;
-			break;
-		}
+		if (dmix->bindings && dmix->bindings[chn] != chn)
+			goto __nointerleaved;
 		if (dst_areas[chn].first != chn * bits ||
-		    dst_areas[chn].step != channels * bits) {
-			interleaved = 0;
-			break;
-		}
+		    dst_areas[chn].step != channels * bits)
+			goto __nointerleaved;
 		if (src_areas[chn].first != chn * bits ||
-		    src_areas[chn].step != channels * bits) {
-			interleaved = 0;
-			break;
-		}
+		    src_areas[chn].step != channels * bits)
+			goto __nointerleaved;
 	}
-	return dmix->interleaved = interleaved;
+	return dmix->interleaved = 1;
+__nointerleaved:
+	return dmix->interleaved = 0;
 }
 
 /*
@@ -1824,19 +1828,10 @@ static int _snd_pcm_direct_get_slave_ipc_offset(snd_config_t *root,
 			continue;
 		}
 		if (strcmp(id, "card") == 0) {
-			err = snd_config_get_integer(n, &card);
-			if (err < 0) {
-				err = snd_config_get_string(n, &str);
-				if (err < 0) {
-					SNDERR("Invalid type for %s", id);
-					return -EINVAL;
-				}
-				card = snd_card_get_index(str);
-				if (card < 0) {
-					SNDERR("Invalid value for %s", id);
-					return card;
-				}
-			}
+			err = snd_config_get_card(n);
+			if (err < 0)
+				return err;
+			card = err;
 			continue;
 		}
 		if (strcmp(id, "device") == 0) {
@@ -1856,8 +1851,6 @@ static int _snd_pcm_direct_get_slave_ipc_offset(snd_config_t *root,
 			continue;
 		}
 	}
-	if (card < 0)
-		card = 0;
 	if (device < 0)
 		device = 0;
 	if (subdevice < 0)
@@ -1888,7 +1881,11 @@ int snd_pcm_direct_parse_open_conf(snd_config_t *root, snd_config_t *conf,
 	rec->slowptr = 1;
 	rec->max_periods = 0;
 	rec->var_periodsize = 0;
+#ifdef LOCKLESS_DMIX_DEFAULT
 	rec->direct_memory_access = 1;
+#else
+	rec->direct_memory_access = 0;
+#endif
 	rec->hw_ptr_alignment = SND_PCM_HW_PTR_ALIGNMENT_AUTO;
 	rec->tstamp_type = -1;
 
@@ -2091,4 +2088,70 @@ void snd_pcm_direct_reset_slave_ptr(snd_pcm_t *pcm, snd_pcm_direct_t *dmix)
 		dmix->slave_appl_ptr = dmix->slave_hw_ptr =
 			((dmix->slave_hw_ptr / dmix->slave_period_size) *
 			dmix->slave_period_size);
+}
+
+int _snd_pcm_direct_new(snd_pcm_t **pcmp, snd_pcm_direct_t **_dmix, int type,
+			const char *name, struct snd_pcm_direct_open_conf *opts,
+			struct slave_params *params, snd_pcm_stream_t stream, int mode)
+{
+	snd_pcm_direct_t *dmix;
+	int fail_sem_loop = 10;
+	int ret;
+
+	dmix = calloc(1, sizeof(snd_pcm_direct_t));
+	if (!dmix)
+		return -ENOMEM;
+
+	ret = snd_pcm_direct_parse_bindings(dmix, params, opts->bindings);
+	if (ret < 0) {
+		free(dmix);
+		return ret;
+	}
+
+	dmix->ipc_key = opts->ipc_key;
+	dmix->ipc_perm = opts->ipc_perm;
+	dmix->ipc_gid = opts->ipc_gid;
+	dmix->tstamp_type = opts->tstamp_type;
+	dmix->semid = -1;
+	dmix->shmid = -1;
+	dmix->shmptr = (void *) -1;
+	dmix->type = type;
+
+	ret = snd_pcm_new(pcmp, type, name, stream, mode);
+	if (ret < 0)
+		goto _err_nosem;
+
+	while (1) {
+		ret = snd_pcm_direct_semaphore_create_or_connect(dmix);
+		if (ret < 0) {
+			SNDERR("unable to create IPC semaphore");
+			goto _err_nosem_free;
+		}
+		ret = snd_pcm_direct_semaphore_down(dmix, DIRECT_IPC_SEM_CLIENT);
+		if (ret < 0) {
+			snd_pcm_direct_semaphore_discard(dmix);
+			if (--fail_sem_loop <= 0)
+				goto _err_nosem_free;
+			continue;
+		}
+		break;
+	}
+
+	ret = snd_pcm_direct_shm_create_or_connect(dmix);
+	if (ret < 0) {
+		SNDERR("unable to create IPC shm instance");
+		snd_pcm_direct_semaphore_up(dmix, DIRECT_IPC_SEM_CLIENT);
+		goto _err_nosem_free;
+	} else {
+		*_dmix = dmix;
+	}
+
+	return ret;
+_err_nosem_free:
+	snd_pcm_free(*pcmp);
+	*pcmp = NULL;
+_err_nosem:
+	free(dmix->bindings);
+	free(dmix);
+	return ret;
 }

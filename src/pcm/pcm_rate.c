@@ -62,19 +62,62 @@ struct _snd_pcm_rate {
 	void *open_func;
 	void *obj;
 	snd_pcm_rate_ops_t ops;
-	unsigned int get_idx;
-	unsigned int put_idx;
-	int16_t *src_buf;
-	int16_t *dst_buf;
+	unsigned int src_conv_idx;
+	unsigned int dst_conv_idx;
+	snd_pcm_channel_area_t *src_buf;
+	snd_pcm_channel_area_t *dst_buf;
 	int start_pending; /* start is triggered but not commited to slave */
 	snd_htimestamp_t trigger_tstamp;
 	unsigned int plugin_version;
 	unsigned int rate_min, rate_max;
+	snd_pcm_format_t orig_in_format;
+	snd_pcm_format_t orig_out_format;
+	uint64_t in_formats;
+	uint64_t out_formats;
+	unsigned int format_flags;
 };
 
 #define SND_PCM_RATE_PLUGIN_VERSION_OLD	0x010001	/* old rate plugin */
-
 #endif /* DOC_HIDDEN */
+
+/* allocate a channel area and a temporary buffer for the given size */
+static snd_pcm_channel_area_t *
+rate_alloc_tmp_buf(snd_pcm_format_t format,
+		   unsigned int channels, unsigned int frames)
+{
+	snd_pcm_channel_area_t *ap;
+	int width = snd_pcm_format_physical_width(format);
+	unsigned int i;
+
+	ap = malloc(sizeof(*ap) * channels);
+	if (!ap)
+		return NULL;
+	ap->addr = malloc(frames * channels * width / 8);
+	if (!ap->addr) {
+		free(ap);
+		return NULL;
+	}
+
+	/* set up in interleaved format */
+	for (i = 0; i < channels; i++) {
+		ap[i].addr = ap[0].addr + (i * width) / 8;
+		ap[i].first = 0;
+		ap[i].step = width * channels;
+	}
+
+	return ap;
+}
+
+static void rate_free_tmp_buf(snd_pcm_channel_area_t **ptr)
+{
+	snd_pcm_channel_area_t *c = *ptr;
+
+	if (c) {
+		free(c->addr);
+		free(c);
+		*ptr = NULL;
+	}
+}
 
 static int snd_pcm_rate_hw_refine_cprepare(snd_pcm_t *pcm ATTRIBUTE_UNUSED, snd_pcm_hw_params_t *params)
 {
@@ -235,12 +278,84 @@ static int snd_pcm_rate_hw_refine(snd_pcm_t *pcm,
 				       snd_pcm_generic_hw_refine);
 }
 
+/* evaluate the best matching available format to the given format */
+static int get_best_format(uint64_t mask, snd_pcm_format_t orig)
+{
+	int pwidth = snd_pcm_format_physical_width(orig);
+	int width = snd_pcm_format_width(orig);
+	int signd = snd_pcm_format_signed(orig);
+	int best_score = -1;
+	int match = -1;
+	int f, score;
+
+	for (f = 0; f <= SND_PCM_FORMAT_LAST; f++) {
+		if (!(mask & (1ULL << f)))
+			continue;
+		score = 0;
+		if (snd_pcm_format_linear(f)) {
+			if (snd_pcm_format_physical_width(f) == pwidth)
+				score++;
+			if (snd_pcm_format_physical_width(f) >= pwidth)
+				score++;
+			if (snd_pcm_format_width(f) == width)
+				score++;
+			if (snd_pcm_format_signed(f) == signd)
+				score++;
+		}
+		if (score > best_score) {
+			match = f;
+			best_score = score;
+		}
+	}
+
+	return match;
+}
+
+/* set up the input and output formats from the available lists */
+static int choose_preferred_format(snd_pcm_rate_t *rate)
+{
+	uint64_t in_mask = rate->in_formats;
+	uint64_t out_mask = rate->out_formats;
+	int in, out;
+
+	if (!in_mask || !out_mask)
+		return 0;
+
+	if (rate->orig_in_format == rate->orig_out_format)
+		if (in_mask & out_mask & (1ULL << rate->orig_in_format))
+			return 0; /* nothing changed */
+
+ repeat:
+	in = get_best_format(in_mask, rate->orig_in_format);
+	out = get_best_format(out_mask, rate->orig_out_format);
+	if (in < 0 || out < 0)
+		return -ENOENT;
+
+	if ((rate->format_flags & SND_PCM_RATE_FLAG_SYNC_FORMATS) &&
+	    in != out) {
+		if (out_mask & (1ULL << in))
+			out = in;
+		else if (in_mask & (1ULL << out))
+			in = out;
+		else {
+			in_mask &= ~(1ULL << in);
+			out_mask &= ~(1ULL << out);
+			goto repeat;
+		}
+	}
+
+	rate->info.in.format = in;
+	rate->info.out.format = out;
+	return 0;
+}
+
 static int snd_pcm_rate_hw_params(snd_pcm_t *pcm, snd_pcm_hw_params_t * params)
 {
 	snd_pcm_rate_t *rate = pcm->private_data;
 	snd_pcm_t *slave = rate->gen.slave;
 	snd_pcm_rate_side_info_t *sinfo, *cinfo;
-	unsigned int channels, cwidth, swidth, chn;
+	unsigned int channels, acc;
+	int need_src_buf, need_dst_buf;
 	int err = snd_pcm_hw_params_slave(pcm, params,
 					  snd_pcm_rate_hw_refine_cchange,
 					  snd_pcm_rate_hw_refine_sprepare,
@@ -271,6 +386,9 @@ static int snd_pcm_rate_hw_params(snd_pcm_t *pcm, snd_pcm_hw_params_t * params)
 	err = INTERNAL(snd_pcm_hw_params_get_channels)(params, &channels);
 	if (err < 0)
 		return err;
+	err = INTERNAL(snd_pcm_hw_params_get_access)(params, &acc);
+	if (err < 0)
+		return err;
 
 	rate->info.channels = channels;
 	sinfo->format = slave->format;
@@ -282,70 +400,92 @@ static int snd_pcm_rate_hw_params(snd_pcm_t *pcm, snd_pcm_hw_params_t * params)
 		SNDMSG("rate plugin already in use");
 		return -EBUSY;
 	}
-	err = rate->ops.init(rate->obj, &rate->info);
-	if (err < 0)
-		return err;
 
-	rate->pareas = malloc(2 * channels * sizeof(*rate->pareas));
-	if (rate->pareas == NULL)
-		goto error;
-
-	cwidth = snd_pcm_format_physical_width(cinfo->format);
-	swidth = snd_pcm_format_physical_width(sinfo->format);
-	rate->pareas[0].addr = malloc(((cwidth * channels * cinfo->period_size) / 8) +
-				      ((swidth * channels * sinfo->period_size) / 8));
-	if (rate->pareas[0].addr == NULL)
-		goto error;
-
-	rate->sareas = rate->pareas + channels;
-	rate->sareas[0].addr = (char *)rate->pareas[0].addr + ((cwidth * channels * cinfo->period_size) / 8);
-	for (chn = 0; chn < channels; chn++) {
-		rate->pareas[chn].addr = (char *)rate->pareas[0].addr + (cwidth * chn * cinfo->period_size) / 8;
-		rate->pareas[chn].first = 0;
-		rate->pareas[chn].step = cwidth;
-		rate->sareas[chn].addr = (char *)rate->sareas[0].addr + (swidth * chn * sinfo->period_size) / 8;
-		rate->sareas[chn].first = 0;
-		rate->sareas[chn].step = swidth;
+	rate->pareas = rate_alloc_tmp_buf(cinfo->format, channels,
+					  cinfo->period_size);
+	rate->sareas = rate_alloc_tmp_buf(sinfo->format, channels,
+					  sinfo->period_size);
+	if (!rate->pareas || !rate->sareas) {
+		err = -ENOMEM;
+		goto error_pareas;
 	}
 
-	if (rate->ops.convert_s16) {
-		rate->get_idx = snd_pcm_linear_get_index(rate->info.in.format, SND_PCM_FORMAT_S16);
-		rate->put_idx = snd_pcm_linear_put_index(SND_PCM_FORMAT_S16, rate->info.out.format);
-		free(rate->src_buf);
-		rate->src_buf = malloc(channels * rate->info.in.period_size * 2);
-		free(rate->dst_buf);
-		rate->dst_buf = malloc(channels * rate->info.out.period_size * 2);
-		if (! rate->src_buf || ! rate->dst_buf)
+	rate->orig_in_format = rate->info.in.format;
+	rate->orig_out_format = rate->info.out.format;
+	if (choose_preferred_format(rate) < 0) {
+		SNDERR("No matching format in rate plugin");
+		err = -EINVAL;
+		goto error_pareas;
+	}
+
+	err = rate->ops.init(rate->obj, &rate->info);
+	if (err < 0)
+		goto error_init;
+
+	rate_free_tmp_buf(&rate->src_buf);
+	rate_free_tmp_buf(&rate->dst_buf);
+
+	need_src_buf = need_dst_buf = 0;
+
+	if ((rate->format_flags & SND_PCM_RATE_FLAG_INTERLEAVED) &&
+	    !(acc == SND_PCM_ACCESS_MMAP_INTERLEAVED ||
+	      acc == SND_PCM_ACCESS_RW_INTERLEAVED)) {
+		need_src_buf = need_dst_buf = 1;
+	} else {
+		if (rate->orig_in_format != rate->info.in.format)
+			need_src_buf = 1;
+		if (rate->orig_out_format != rate->info.out.format)
+			need_dst_buf = 1;
+	}
+
+	if (need_src_buf) {
+		rate->src_conv_idx =
+			snd_pcm_linear_convert_index(rate->orig_in_format,
+						     rate->info.in.format);
+		rate->src_buf = rate_alloc_tmp_buf(rate->info.in.format,
+						   channels, rate->info.in.period_size);
+		if (!rate->src_buf) {
+			err = -ENOMEM;
 			goto error;
+		}
+	}
+
+	if (need_dst_buf) {
+		rate->dst_conv_idx =
+			snd_pcm_linear_convert_index(rate->info.out.format,
+						     rate->orig_out_format);
+		rate->dst_buf = rate_alloc_tmp_buf(rate->info.out.format,
+						   channels, rate->info.out.period_size);
+		if (!rate->dst_buf) {
+			err = -ENOMEM;
+			goto error;
+		}
 	}
 
 	return 0;
 
  error:
-	if (rate->pareas) {
-		free(rate->pareas[0].addr);
-		free(rate->pareas);
-		rate->pareas = NULL;
-	}
+	rate_free_tmp_buf(&rate->src_buf);
+	rate_free_tmp_buf(&rate->dst_buf);
+ error_init:
 	if (rate->ops.free)
 		rate->ops.free(rate->obj);
-	return -ENOMEM;
+ error_pareas:
+	rate_free_tmp_buf(&rate->pareas);
+	rate_free_tmp_buf(&rate->sareas);
+	return err;
 }
 
 static int snd_pcm_rate_hw_free(snd_pcm_t *pcm)
 {
 	snd_pcm_rate_t *rate = pcm->private_data;
-	if (rate->pareas) {
-		free(rate->pareas[0].addr);
-		free(rate->pareas);
-		rate->pareas = NULL;
-		rate->sareas = NULL;
-	}
+
+	rate_free_tmp_buf(&rate->pareas);
+	rate_free_tmp_buf(&rate->sareas);
 	if (rate->ops.free)
 		rate->ops.free(rate->obj);
-	free(rate->src_buf);
-	free(rate->dst_buf);
-	rate->src_buf = rate->dst_buf = NULL;
+	rate_free_tmp_buf(&rate->src_buf);
+	rate_free_tmp_buf(&rate->dst_buf);
 	return snd_pcm_hw_free(rate->gen.slave);
 }
 
@@ -426,82 +566,6 @@ static int snd_pcm_rate_init(snd_pcm_t *pcm)
 	return 0;
 }
 
-static void convert_to_s16(snd_pcm_rate_t *rate, int16_t *buf,
-			   const snd_pcm_channel_area_t *areas,
-			   snd_pcm_uframes_t offset, unsigned int frames,
-			   unsigned int channels)
-{
-#ifndef DOC_HIDDEN
-#define GET16_LABELS
-#include "plugin_ops.h"
-#undef GET16_LABELS
-#endif /* DOC_HIDDEN */
-	void *get = get16_labels[rate->get_idx];
-	const char *src;
-	int16_t sample;
-	const char *srcs[channels];
-	int src_step[channels];
-	unsigned int c;
-
-	for (c = 0; c < channels; c++) {
-		srcs[c] = snd_pcm_channel_area_addr(areas + c, offset);
-		src_step[c] = snd_pcm_channel_area_step(areas + c);
-	}
-
-	while (frames--) {
-		for (c = 0; c < channels; c++) {
-			src = srcs[c];
-			goto *get;
-#ifndef DOC_HIDDEN
-#define GET16_END after_get
-#include "plugin_ops.h"
-#undef GET16_END
-#endif /* DOC_HIDDEN */
-		after_get:
-			*buf++ = sample;
-			srcs[c] += src_step[c];
-		}
-	}
-}
-
-static void convert_from_s16(snd_pcm_rate_t *rate, const int16_t *buf,
-			     const snd_pcm_channel_area_t *areas,
-			     snd_pcm_uframes_t offset, unsigned int frames,
-			     unsigned int channels)
-{
-#ifndef DOC_HIDDEN
-#define PUT16_LABELS
-#include "plugin_ops.h"
-#undef PUT16_LABELS
-#endif /* DOC_HIDDEN */
-	void *put = put16_labels[rate->put_idx];
-	char *dst;
-	int16_t sample;
-	char *dsts[channels];
-	int dst_step[channels];
-	unsigned int c;
-
-	for (c = 0; c < channels; c++) {
-		dsts[c] = snd_pcm_channel_area_addr(areas + c, offset);
-		dst_step[c] = snd_pcm_channel_area_step(areas + c);
-	}
-
-	while (frames--) {
-		for (c = 0; c < channels; c++) {
-			dst = dsts[c];
-			sample = *buf++;
-			goto *put;
-#ifndef DOC_HIDDEN
-#define PUT16_END after_put
-#include "plugin_ops.h"
-#undef PUT16_END
-#endif /* DOC_HIDDEN */
-		after_put:
-			dsts[c] += dst_step[c];
-		}
-	}
-}
-
 static void do_convert(const snd_pcm_channel_area_t *dst_areas,
 		       snd_pcm_uframes_t dst_offset, unsigned int dst_frames,
 		       const snd_pcm_channel_area_t *src_areas,
@@ -509,28 +573,40 @@ static void do_convert(const snd_pcm_channel_area_t *dst_areas,
 		       unsigned int channels,
 		       snd_pcm_rate_t *rate)
 {
-	if (rate->ops.convert_s16) {
-		const int16_t *src;
-		int16_t *dst;
-		if (! rate->src_buf)
-			src = (int16_t *)src_areas->addr + src_offset * channels;
-		else {
-			convert_to_s16(rate, rate->src_buf, src_areas, src_offset,
-				       src_frames, channels);
-			src = rate->src_buf;
-		}
-		if (! rate->dst_buf)
-			dst = (int16_t *)dst_areas->addr + dst_offset * channels;
-		else
-			dst = rate->dst_buf;
-		rate->ops.convert_s16(rate->obj, dst, dst_frames, src, src_frames);
-		if (dst == rate->dst_buf)
-			convert_from_s16(rate, rate->dst_buf, dst_areas, dst_offset,
-					 dst_frames, channels);
+	const snd_pcm_channel_area_t *out_areas;
+	snd_pcm_uframes_t out_offset;
+
+	if (rate->dst_buf) {
+		out_areas = rate->dst_buf;
+		out_offset = 0;
 	} else {
-		rate->ops.convert(rate->obj, dst_areas, dst_offset, dst_frames,
-				   src_areas, src_offset, src_frames);
+		out_areas = dst_areas;
+		out_offset = dst_offset;
 	}
+
+	if (rate->src_buf) {
+		snd_pcm_linear_convert(rate->src_buf, 0,
+				       src_areas, src_offset,
+				       channels, src_frames,
+				       rate->src_conv_idx);
+		src_areas = rate->src_buf;
+		src_offset = 0;
+	}
+
+	if (rate->ops.convert)
+		rate->ops.convert(rate->obj, out_areas, out_offset, dst_frames,
+				   src_areas, src_offset, src_frames);
+	else
+		rate->ops.convert_s16(rate->obj,
+				      snd_pcm_channel_area_addr(out_areas, out_offset),
+				      dst_frames,
+				      snd_pcm_channel_area_addr(src_areas, src_offset),
+				      src_frames);
+	if (rate->dst_buf)
+		snd_pcm_linear_convert(dst_areas, dst_offset,
+				       rate->dst_buf, 0,
+				       channels, dst_frames,
+				       rate->dst_conv_idx);
 }
 
 static inline void
@@ -561,17 +637,16 @@ snd_pcm_rate_read_areas1(snd_pcm_t *pcm,
 
 static inline void snd_pcm_rate_sync_hwptr0(snd_pcm_t *pcm, snd_pcm_uframes_t slave_hw_ptr)
 {
-	snd_pcm_rate_t *rate = pcm->private_data;
-
-	snd_pcm_sframes_t slave_hw_ptr_diff = slave_hw_ptr - rate->last_slave_hw_ptr;
+	snd_pcm_rate_t *rate;
+	snd_pcm_sframes_t slave_hw_ptr_diff;
 	snd_pcm_sframes_t last_slave_hw_ptr_frac;
 
 	if (pcm->stream != SND_PCM_STREAM_PLAYBACK)
 		return;
 
-	if (slave_hw_ptr_diff < 0)
-		slave_hw_ptr_diff += rate->gen.slave->boundary; /* slave boundary wraparound */
-	else if (slave_hw_ptr_diff == 0)
+	rate = pcm->private_data;
+	slave_hw_ptr_diff = pcm_frame_diff(slave_hw_ptr, rate->last_slave_hw_ptr, rate->gen.slave->boundary);
+	if (slave_hw_ptr_diff == 0)
 		return;
 	last_slave_hw_ptr_frac = rate->last_slave_hw_ptr % rate->gen.slave->period_size;
 	/* While handling fraction part fo slave period, rounded value will be
@@ -612,11 +687,7 @@ static snd_pcm_uframes_t snd_pcm_rate_playback_internal_delay(snd_pcm_t *pcm)
 {
 	snd_pcm_rate_t *rate = pcm->private_data;
 
-	if (rate->appl_ptr < rate->last_commit_ptr) {
-		return rate->appl_ptr - rate->last_commit_ptr + pcm->boundary;
-	} else {
-		return rate->appl_ptr - rate->last_commit_ptr;
-	}
+	return pcm_frame_diff(rate->appl_ptr, rate->last_commit_ptr, pcm->boundary);
 }
 
 static int snd_pcm_rate_delay(snd_pcm_t *pcm, snd_pcm_sframes_t *delayp)
@@ -637,7 +708,7 @@ static int snd_pcm_rate_delay(snd_pcm_t *pcm, snd_pcm_sframes_t *delayp)
 				+ snd_pcm_rate_playback_internal_delay(pcm);
 	} else {
 		*delayp = rate->ops.output_frames(rate->obj, slave_delay)
-				+ snd_pcm_mmap_capture_hw_avail(pcm);
+				+ snd_pcm_mmap_capture_delay(pcm);
 	}
 	return 0;
 }
@@ -746,7 +817,6 @@ static int snd_pcm_rate_commit_area(snd_pcm_t *pcm, snd_pcm_rate_t *rate,
 		if (result < 0)
 			return result;
 	      __partial:
-		xfer = 0;
 		cont = slave_frames;
 		if (cont > slave_size)
 			cont = slave_size;
@@ -846,7 +916,6 @@ static int snd_pcm_rate_grab_next_period(snd_pcm_t *pcm, snd_pcm_uframes_t hw_of
 		if (result < 0)
 			return result;
 	      __partial:
-		xfer = 0;
 		cont = slave_frames;
 		if (cont > rate->gen.slave->period_size)
 			cont = rate->gen.slave->period_size;
@@ -928,10 +997,7 @@ static int snd_pcm_rate_sync_playback_area(snd_pcm_t *pcm, snd_pcm_uframes_t app
 	if (slave_size < 0)
 		return slave_size;
 
-	if (appl_ptr < rate->last_commit_ptr)
-		xfer = appl_ptr - rate->last_commit_ptr + pcm->boundary;
-	else
-		xfer = appl_ptr - rate->last_commit_ptr;
+	xfer = pcm_frame_diff(appl_ptr, rate->last_commit_ptr, pcm->boundary);
 	while (xfer >= pcm->period_size &&
 	       (snd_pcm_uframes_t)slave_size >= rate->gen.slave->period_size) {
 		err = snd_pcm_rate_commit_next_period(pcm, rate->last_commit_ptr % pcm->buffer_size);
@@ -966,29 +1032,18 @@ static snd_pcm_sframes_t snd_pcm_rate_mmap_commit(snd_pcm_t *pcm,
 	return size;
 }
 
-static snd_pcm_sframes_t snd_pcm_rate_avail_update(snd_pcm_t *pcm)
+static snd_pcm_sframes_t snd_pcm_rate_avail_update_capture(snd_pcm_t *pcm,
+							   snd_pcm_sframes_t slave_size)
 {
 	snd_pcm_rate_t *rate = pcm->private_data;
 	snd_pcm_t *slave = rate->gen.slave;
-	snd_pcm_sframes_t slave_size;
-
-	slave_size = snd_pcm_avail_update(slave);
-	if (slave_size < 0)
-		return slave_size;
-
-	if (pcm->stream == SND_PCM_STREAM_CAPTURE)
-		goto _capture;
-	snd_pcm_rate_sync_hwptr(pcm);
-	snd_pcm_rate_sync_playback_area(pcm, rate->appl_ptr);
-	return snd_pcm_mmap_avail(pcm);
- _capture: {
 	snd_pcm_uframes_t xfer, hw_offset, size;
 	
 	xfer = snd_pcm_mmap_capture_avail(pcm);
 	size = pcm->buffer_size - xfer;
 	hw_offset = snd_pcm_mmap_hw_offset(pcm);
 	while (size >= pcm->period_size &&
-	       (snd_pcm_uframes_t)slave_size >= rate->gen.slave->period_size) {
+	       (snd_pcm_uframes_t)slave_size >= slave->period_size) {
 		int err = snd_pcm_rate_grab_next_period(pcm, hw_offset);
 		if (err < 0)
 			return err;
@@ -996,13 +1051,29 @@ static snd_pcm_sframes_t snd_pcm_rate_avail_update(snd_pcm_t *pcm)
 			return (snd_pcm_sframes_t)xfer;
 		xfer += pcm->period_size;
 		size -= pcm->period_size;
-		slave_size -= rate->gen.slave->period_size;
+		slave_size -= slave->period_size;
 		hw_offset += pcm->period_size;
 		hw_offset %= pcm->buffer_size;
 		snd_pcm_mmap_hw_forward(pcm, pcm->period_size);
 	}
 	return (snd_pcm_sframes_t)xfer;
- }
+}
+
+static snd_pcm_sframes_t snd_pcm_rate_avail_update(snd_pcm_t *pcm)
+{
+	snd_pcm_rate_t *rate = pcm->private_data;
+	snd_pcm_sframes_t slave_size;
+
+	slave_size = snd_pcm_avail_update(rate->gen.slave);
+	if (slave_size < 0)
+		return slave_size;
+
+	if (pcm->stream == SND_PCM_STREAM_CAPTURE)
+		return snd_pcm_rate_avail_update_capture(pcm, slave_size);
+
+	snd_pcm_rate_sync_hwptr(pcm);
+	snd_pcm_rate_sync_playback_area(pcm, rate->appl_ptr);
+	return snd_pcm_mmap_avail(pcm);
 }
 
 static int snd_pcm_rate_htimestamp(snd_pcm_t *pcm,
@@ -1051,6 +1122,7 @@ static int snd_pcm_rate_drain(snd_pcm_t *pcm)
 		/* commit the remaining fraction (if any) */
 		snd_pcm_uframes_t size, ofs, saved_avail_min;
 		snd_pcm_sw_params_t sw_params;
+		int commit_err = 0;
 
 		__snd_pcm_lock(pcm);
 		/* temporarily set avail_min to one */
@@ -1059,9 +1131,7 @@ static int snd_pcm_rate_drain(snd_pcm_t *pcm)
 		sw_params.avail_min = 1;
 		snd_pcm_sw_params(rate->gen.slave, &sw_params);
 
-		size = rate->appl_ptr - rate->last_commit_ptr;
-		if (size > pcm->boundary)
-			size -= pcm->boundary;
+		size = pcm_frame_diff(rate->appl_ptr, rate->last_commit_ptr, pcm->boundary);
 		ofs = rate->last_commit_ptr % pcm->buffer_size;
 		while (size > 0) {
 			snd_pcm_uframes_t psize, spsize;
@@ -1079,14 +1149,29 @@ static int snd_pcm_rate_drain(snd_pcm_t *pcm)
 				if (! spsize)
 					break;
 			}
-			snd_pcm_rate_commit_area(pcm, rate, ofs,
+			commit_err = snd_pcm_rate_commit_area(pcm, rate, ofs,
 						 psize, spsize);
+			if (commit_err == 1) {
+				rate->last_commit_ptr += psize;
+				if (rate->last_commit_ptr >= pcm->boundary)
+					rate->last_commit_ptr = 0;
+			} else if (commit_err == 0) {
+				if (pcm->mode & SND_PCM_NONBLOCK) {
+					commit_err = -EAGAIN;
+					break;
+				}
+				continue;
+			} else
+				break;
+
 			ofs = (ofs + psize) % pcm->buffer_size;
 			size -= psize;
 		}
 		sw_params.avail_min = saved_avail_min;
 		snd_pcm_sw_params(rate->gen.slave, &sw_params);
 		__snd_pcm_unlock(pcm);
+		if (commit_err < 0)
+			return commit_err;
 	}
 	return snd_pcm_drain(rate->gen.slave);
 }
@@ -1148,12 +1233,8 @@ static int snd_pcm_rate_status(snd_pcm_t *pcm, snd_pcm_status_t * status)
 		status->avail = snd_pcm_mmap_playback_avail(pcm);
 		status->avail_max = rate->ops.input_frames(rate->obj, status->avail_max);
 	} else {
-		/* FIXME: Maybe possible to somthing similar to
-		 * snd_pcm_rate_playback_internal_delay()
-		 * for the capture case.
-		 */
 		status->delay = rate->ops.output_frames(rate->obj, status->delay)
-					+ snd_pcm_mmap_capture_hw_avail(pcm);
+					+ snd_pcm_mmap_capture_delay(pcm);
 		status->avail = snd_pcm_mmap_capture_avail(pcm);
 		status->avail_max = rate->ops.output_frames(rate->obj, status->avail_max);
 	}
@@ -1253,6 +1334,30 @@ const snd_config_t *snd_pcm_rate_get_default_converter(snd_config_t *root)
 	return NULL;
 }
 
+static void rate_initial_setup(snd_pcm_rate_t *rate)
+{
+	if (rate->plugin_version == SND_PCM_RATE_PLUGIN_VERSION)
+		rate->plugin_version = rate->ops.version;
+
+	if (rate->plugin_version >= 0x010002 &&
+	    rate->ops.get_supported_rates)
+		rate->ops.get_supported_rates(rate->obj,
+					      &rate->rate_min,
+					      &rate->rate_max);
+
+	if (rate->plugin_version >= 0x010003 &&
+	    rate->ops.get_supported_formats) {
+		rate->ops.get_supported_formats(rate->obj,
+						&rate->in_formats,
+						&rate->out_formats,
+						&rate->format_flags);
+	} else if (!rate->ops.convert && rate->ops.convert_s16) {
+		rate->in_formats = rate->out_formats =
+			1ULL << SND_PCM_FORMAT_S16;
+		rate->format_flags = SND_PCM_RATE_FLAG_INTERLEAVED;
+	}
+}
+
 #ifdef PIC
 static int is_builtin_plugin(const char *type)
 {
@@ -1265,7 +1370,7 @@ static const char *const default_rate_plugins[] = {
 
 static int rate_open_func(snd_pcm_rate_t *rate, const char *type, const snd_config_t *converter_conf, int verbose)
 {
-	char open_name[64], open_conf_name[64], lib_name[128], *lib = NULL;
+	char open_name[64], open_conf_name[64], lib_name[64], *lib = NULL;
 	snd_pcm_rate_open_func_t open_func;
 	snd_pcm_rate_open_conf_func_t open_conf_func;
 	int err;
@@ -1274,24 +1379,15 @@ static int rate_open_func(snd_pcm_rate_t *rate, const char *type, const snd_conf
 	snprintf(open_conf_name, sizeof(open_conf_name), "_snd_pcm_rate_%s_open_conf", type);
 	if (!is_builtin_plugin(type)) {
 		snprintf(lib_name, sizeof(lib_name),
-				 "%s/libasound_module_rate_%s.so", ALSA_PLUGIN_DIR, type);
+				 "libasound_module_rate_%s.so", type);
 		lib = lib_name;
 	}
-
-	rate->rate_min = SND_PCM_PLUGIN_RATE_MIN;
-	rate->rate_max = SND_PCM_PLUGIN_RATE_MAX;
-	rate->plugin_version = SND_PCM_RATE_PLUGIN_VERSION;
 
 	open_conf_func = snd_dlobj_cache_get(lib, open_conf_name, NULL, verbose && converter_conf != NULL);
 	if (open_conf_func) {
 		err = open_conf_func(SND_PCM_RATE_PLUGIN_VERSION,
 				     &rate->obj, &rate->ops, converter_conf);
 		if (!err) {
-			rate->plugin_version = rate->ops.version;
-			if (rate->ops.get_supported_rates)
-				rate->ops.get_supported_rates(rate->obj,
-							      &rate->rate_min,
-							      &rate->rate_max);
 			rate->open_func = open_conf_func;
 			return 0;
 		} else {
@@ -1307,23 +1403,18 @@ static int rate_open_func(snd_pcm_rate_t *rate, const char *type, const snd_conf
 	rate->open_func = open_func;
 
 	err = open_func(SND_PCM_RATE_PLUGIN_VERSION, &rate->obj, &rate->ops);
-	if (!err) {
-		rate->plugin_version = rate->ops.version;
-		if (rate->ops.get_supported_rates)
-			rate->ops.get_supported_rates(rate->obj,
-						      &rate->rate_min,
-						      &rate->rate_max);
+	if (!err)
 		return 0;
-	}
 
 	/* try to open with the old protocol version */
 	rate->plugin_version = SND_PCM_RATE_PLUGIN_VERSION_OLD;
 	err = open_func(SND_PCM_RATE_PLUGIN_VERSION_OLD,
 			&rate->obj, &rate->ops);
-	if (err) {
-		snd_dlobj_cache_put(open_func);
-		rate->open_func = NULL;
-	}
+	if (!err)
+		return 0;
+
+	snd_dlobj_cache_put(open_func);
+	rate->open_func = NULL;
 	return err;
 }
 #endif
@@ -1393,6 +1484,10 @@ int snd_pcm_rate_open(snd_pcm_t **pcmp, const char *name,
 	rate->gen.close_slave = close_slave;
 	rate->srate = srate;
 	rate->sformat = sformat;
+
+	rate->rate_min = SND_PCM_PLUGIN_RATE_MIN;
+	rate->rate_max = SND_PCM_PLUGIN_RATE_MAX;
+	rate->plugin_version = SND_PCM_RATE_PLUGIN_VERSION;
 
 	err = snd_pcm_new(&pcm, SND_PCM_TYPE_RATE, name, slave->stream, slave->mode);
 	if (err < 0) {
@@ -1472,6 +1567,8 @@ int snd_pcm_rate_open(snd_pcm_t **pcmp, const char *name,
 		free(rate);
 		return err;
 	}
+
+	rate_initial_setup(rate);
 
 	pcm->ops = &snd_pcm_rate_ops;
 	pcm->fast_ops = &snd_pcm_rate_fast_ops;
